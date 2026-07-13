@@ -1,11 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   AlertCircle,
   CheckCircle2,
+  ClipboardPaste,
   Download,
   FileDown,
   FolderInput,
@@ -84,6 +86,21 @@ type QueueItem = {
 type FoundEntry = ProbeEntry & {
   selected: boolean;
   resolution: number | null;
+  groupId: string;
+  contentTitle: string;
+  sourcePage: string;
+};
+
+type FoundGroup = {
+  id: string;
+  title: string;
+  sourcePage: string;
+  entries: FoundEntry[];
+};
+
+type DetectionFailure = {
+  url: string;
+  error: string;
 };
 
 type DownloadEvent = {
@@ -168,8 +185,8 @@ function makeId() {
   return crypto.randomUUID();
 }
 
-function extractUrls(raw: string) {
-  return raw.match(/https?:\/\/[^\s,]+/gi) ?? [];
+function extractUrls(raw: string): string[] {
+  return [...(raw.match(/https?:\/\/[^\s,]+/gi) ?? [])];
 }
 
 function entryTitle(entry: ProbeEntry) {
@@ -189,6 +206,7 @@ function compactUrl(url: string) {
 export function App() {
   const sourceInputRef = useRef<HTMLTextAreaElement>(null);
   const availableUpdate = useRef<Update | null>(null);
+  const lastLoggedStatus = useRef<Map<string, DownloadStatus>>(new Map());
   const [sourceText, setSourceText] = useState("");
   const [referer, setReferer] = useState("");
   const [browser, setBrowser] = useState("app");
@@ -198,6 +216,8 @@ export function App() {
   const [outputDir, setOutputDir] = useState("");
   const [tools, setTools] = useState<ToolState | null>(null);
   const [found, setFound] = useState<FoundEntry[]>([]);
+  const [detectionFailures, setDetectionFailures] = useState<DetectionFailure[]>([]);
+  const [retryingSources, setRetryingSources] = useState<Set<string>>(new Set());
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [isProbing, setIsProbing] = useState(false);
@@ -212,7 +232,7 @@ export function App() {
   );
   const [isConfirming, setIsConfirming] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [appVersion, setAppVersion] = useState("1.0.0");
+  const [appVersion, setAppVersion] = useState("1.1.0");
   const [updateState, setUpdateState] = useState<UpdateState>({
     status: "idle",
     progress: 0,
@@ -227,6 +247,24 @@ export function App() {
     () => found.filter((entry) => entry.selected),
     [found]
   );
+
+  const foundGroups = useMemo<FoundGroup[]>(() => {
+    const groups = new Map<string, FoundGroup>();
+    for (const entry of found) {
+      const existing = groups.get(entry.groupId);
+      if (existing) {
+        existing.entries.push(entry);
+      } else {
+        groups.set(entry.groupId, {
+          id: entry.groupId,
+          title: entry.contentTitle,
+          sourcePage: entry.sourcePage,
+          entries: [entry]
+        });
+      }
+    }
+    return [...groups.values()];
+  }, [found]);
 
   const queueStats = useMemo(() => {
     const total = queue.length;
@@ -256,7 +294,9 @@ export function App() {
         current.map((item) => mergeDownloadUpdate(item, payload))
       );
 
-      if (payload.message) {
+      const previousStatus = lastLoggedStatus.current.get(payload.id);
+      if (payload.message && previousStatus !== payload.status) {
+        lastLoggedStatus.current.set(payload.id, payload.status);
         setLogs((current) =>
           [`${statusCopy[payload.status]}: ${payload.message}`, ...current].slice(
             0,
@@ -471,6 +511,62 @@ export function App() {
     }
   }
 
+  async function probeSingleUrl(url: string) {
+    try {
+      return await invoke<ProbeResult>("probe_url", {
+        url,
+        browser: browser === "none" ? null : browser
+      });
+    } catch (extractorError) {
+      if (String(extractorError).includes("Busqueda detenida")) {
+        throw extractorError;
+      }
+      try {
+        const result = await invoke<ProbeResult>("scan_page", {
+          url,
+          referer: referer.trim() || null
+        });
+        if (!referer.trim()) setReferer(url);
+        return result;
+      } catch (scanError) {
+        if (String(scanError).includes("Busqueda detenida")) {
+          throw scanError;
+        }
+        throw new Error(
+          `yt-dlp: ${String(extractorError)} | Escaneo: ${String(scanError)}`
+        );
+      }
+    }
+  }
+
+  function mapProbeEntries(result: ProbeResult, sourceUrl: string) {
+    const mapped: FoundEntry[] = [];
+    const selectedGroups = new Set<string>();
+    const seen = new Set<string>();
+    for (const entry of result.entries) {
+      const key = entry.webpage_url || entry.url;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const choiceGroup = entry.choice_group;
+      const selected = !choiceGroup || !selectedGroups.has(choiceGroup);
+      if (choiceGroup && selected) selectedGroups.add(choiceGroup);
+      const groupId = choiceGroup || key;
+      const contentTitle = choiceGroup
+        ? result.title?.trim() || compactUrl(sourceUrl)
+        : entry.title?.trim() || result.title?.trim() || compactUrl(sourceUrl);
+      mapped.push({
+        ...entry,
+        resolutions: entry.resolutions ?? [],
+        selected,
+        resolution: null,
+        groupId,
+        contentTitle,
+        sourcePage: result.source_url || sourceUrl
+      });
+    }
+    return mapped;
+  }
+
   async function probeSource() {
     const extracted = extractUrls(sourceText);
     const urls = extracted.length ? extracted : [sourceText.trim()];
@@ -484,77 +580,70 @@ export function App() {
     try {
       const detected: FoundEntry[] = [];
       const seen = new Set<string>();
-      const selectedGroups = new Set<string>();
-      const errors: string[] = [];
+      const errors: DetectionFailure[] = [];
 
       for (const [urlIndex, url] of urls.entries()) {
-        let result: ProbeResult;
         try {
-          try {
-            result = await invoke<ProbeResult>("probe_url", {
-              url,
-              browser: browser === "none" ? null : browser
-            });
-          } catch (extractorError) {
-            if (String(extractorError).includes("Busqueda detenida")) {
-              throw extractorError;
-            }
-            try {
-              result = await invoke<ProbeResult>("scan_page", {
-                url,
-                referer: referer.trim() || null
-              });
-            } catch (scanError) {
-              if (String(scanError).includes("Busqueda detenida")) {
-                throw scanError;
-              }
-              throw new Error(
-                `yt-dlp: ${String(extractorError)} | Escaneo: ${String(scanError)}`
-              );
-            }
-            if (!referer.trim()) setReferer(url);
-          }
-
-          for (const entry of result.entries) {
+          const result = await probeSingleUrl(url);
+          for (const entry of mapProbeEntries(result, url)) {
             const key = entry.webpage_url || entry.url;
             if (seen.has(key)) continue;
             seen.add(key);
-            const choiceGroup = entry.choice_group;
-            const selected = !choiceGroup || !selectedGroups.has(choiceGroup);
-            if (choiceGroup && selected) selectedGroups.add(choiceGroup);
-            detected.push({
-              ...entry,
-              resolutions: entry.resolutions ?? [],
-              selected,
-              resolution: null
-            });
+            detected.push(entry);
           }
-          setNotice(
-            `Buscando ${urlIndex + 1} de ${urls.length}...`
-          );
+          setNotice(`Buscando ${urlIndex + 1} de ${urls.length}...`);
         } catch (error) {
           if (String(error).includes("Busqueda detenida")) throw error;
-          errors.push(`${compactUrl(url)}: ${String(error)}`);
+          errors.push({ url, error: String(error) });
         }
       }
 
       setFound(detected);
-      if (!detected.length && errors.length) {
-        throw new Error(errors.join(" | "));
-      }
+      setDetectionFailures(errors);
       setNotice(
-        `${detected.length} entrada(s) detectada(s)` +
-          (errors.length ? ` - ${errors.length} URL(s) con error.` : ".")
+        `${new Set(detected.map((entry) => entry.groupId)).size} contenido(s) listo(s)` +
+          (errors.length ? ` - ${errors.length} enlace(s) con error.` : ".")
       );
     } catch (error) {
       if (String(error).includes("Busqueda detenida")) {
         setNotice("Busqueda detenida.");
       } else {
         setNotice(String(error));
-        setFound([]);
       }
     } finally {
       setIsProbing(false);
+    }
+  }
+
+  async function retryFailedSource(failure: DetectionFailure) {
+    setRetryingSources((current) => new Set(current).add(failure.url));
+    try {
+      const result = await probeSingleUrl(failure.url);
+      const recovered = mapProbeEntries(result, failure.url);
+      setFound((current) => {
+        const existing = new Set(current.map((entry) => entry.webpage_url || entry.url));
+        return [
+          ...current,
+          ...recovered.filter((entry) => !existing.has(entry.webpage_url || entry.url))
+        ];
+      });
+      setDetectionFailures((current) =>
+        current.filter((entry) => entry.url !== failure.url)
+      );
+      setNotice(`Enlace recuperado: ${compactUrl(failure.url)}.`);
+    } catch (error) {
+      setDetectionFailures((current) =>
+        current.map((entry) =>
+          entry.url === failure.url ? { ...entry, error: String(error) } : entry
+        )
+      );
+      setNotice(`El enlace sigue fallando: ${compactUrl(failure.url)}.`);
+    } finally {
+      setRetryingSources((current) => {
+        const next = new Set(current);
+        next.delete(failure.url);
+        return next;
+      });
     }
   }
 
@@ -570,6 +659,37 @@ export function App() {
   function clearSource() {
     setSourceText("");
     window.requestAnimationFrame(() => sourceInputRef.current?.focus());
+  }
+
+  async function pasteSources() {
+    try {
+      const clipboard = await readText();
+      const pastedUrls = extractUrls(clipboard);
+      if (!pastedUrls.length) {
+        setNotice("El portapapeles no contiene enlaces.");
+        return;
+      }
+
+      const urls = extractUrls(sourceText);
+      const seen = new Set(urls);
+      let added = 0;
+      for (const url of pastedUrls) {
+        if (!seen.has(url)) {
+          seen.add(url);
+          urls.push(url);
+          added += 1;
+        }
+      }
+      setSourceText(urls.join("\n"));
+      window.requestAnimationFrame(() => sourceInputRef.current?.focus());
+      setNotice(
+        added > 0
+          ? `${added} enlace(s) pegado(s). Podes seguir pegando o buscar todos.`
+          : "Esos enlaces ya estaban en la lista."
+      );
+    } catch (error) {
+      setNotice(`No pude leer el portapapeles: ${String(error)}`);
+    }
   }
 
   function addUrlsFromText() {
@@ -592,7 +712,23 @@ export function App() {
   }
 
   async function downloadSelectedFound() {
-    const inputs = foundEntriesToQueueInput(selectedFound);
+    await downloadFoundEntries(selectedFound);
+  }
+
+  function entriesForGroup(groupId: string) {
+    return found.filter((entry) => entry.groupId === groupId && entry.selected);
+  }
+
+  function addFoundGroup(groupId: string) {
+    addToQueue(foundEntriesToQueueInput(entriesForGroup(groupId)));
+  }
+
+  async function downloadFoundGroup(groupId: string) {
+    await downloadFoundEntries(entriesForGroup(groupId));
+  }
+
+  async function downloadFoundEntries(entries: FoundEntry[]) {
+    const inputs = foundEntriesToQueueInput(entries);
     const fresh = addToQueue(inputs);
     const selectedUrls = new Set(inputs.map((item) => item.url));
     const alreadyQueued = queue.filter(
@@ -604,10 +740,14 @@ export function App() {
     await startJobs([...alreadyQueued, ...fresh]);
   }
 
+  function removeFoundGroup(groupId: string) {
+    setFound((current) => current.filter((entry) => entry.groupId !== groupId));
+  }
+
   function foundEntriesToQueueInput(entries: FoundEntry[]) {
     return entries.map((entry) => ({
       url: entry.webpage_url || entry.url,
-      title: entryTitle(entry),
+      title: entry.contentTitle || entryTitle(entry),
       resolutions: entry.resolutions,
       resolution: entry.resolution
     }));
@@ -725,6 +865,7 @@ export function App() {
     setQueue([]);
     setLogs([]);
     setFound([]);
+    setDetectionFailures([]);
   }
 
   async function confirmQueueAction() {
@@ -824,15 +965,25 @@ export function App() {
           <div className="field">
             <div className="field-label-row">
               <span>URL o lista</span>
-              <button
-                className="clear-input-button"
-                onClick={clearSource}
-                disabled={!sourceText}
-                title="Limpiar URL"
-                aria-label="Limpiar URL"
-              >
-                <X size={15} />
-              </button>
+              <div className="field-label-actions">
+                <button
+                  className="paste-button"
+                  onClick={() => void pasteSources()}
+                  title="Pegar enlaces del portapapeles"
+                >
+                  <ClipboardPaste size={15} />
+                  Pegar
+                </button>
+                <button
+                  className="clear-input-button"
+                  onClick={clearSource}
+                  disabled={!sourceText}
+                  title="Limpiar URL"
+                  aria-label="Limpiar URL"
+                >
+                  <X size={15} />
+                </button>
+              </div>
             </div>
             <textarea
               ref={sourceInputRef}
@@ -927,15 +1078,15 @@ export function App() {
           </label>
         </section>
 
-        {found.length > 0 && (
+        {(found.length > 0 || detectionFailures.length > 0) && (
           <section className="found-panel">
             <div className="panel-head compact">
               <div>
                 <h2>Detectados</h2>
                 <p className="found-count">
-                  {selectedFound.length} seleccionados
-                  {found.some((entry) => entry.choice_group)
-                    ? " - una fuente por contenido"
+                  {foundGroups.length} listo(s)
+                  {detectionFailures.length > 0
+                    ? ` - ${detectionFailures.length} con error`
                     : ""}
                 </p>
               </div>
@@ -947,7 +1098,7 @@ export function App() {
                   title="Agregar seleccionados"
                 >
                   <Plus size={17} />
-                  Agregar
+                  Agregar todos
                 </button>
                 <button
                   className="primary-button compact-button"
@@ -956,85 +1107,173 @@ export function App() {
                   title="Descargar seleccionados"
                 >
                   <Download size={17} />
-                  Descargar
+                  Descargar todo
                 </button>
               </div>
             </div>
 
             <div className="found-list">
-              {found.map((entry, index) => (
-                <div className="found-row" key={`${entry.url}-${index}`}>
-                  <input
-                    type={entry.choice_group ? "radio" : "checkbox"}
-                    name={entry.choice_group ? `source-${entry.choice_group}` : undefined}
-                    aria-label={`Seleccionar ${entryTitle(entry)}`}
-                    checked={entry.selected}
-                    onChange={(event) => {
-                      const checked = event.target.checked;
-                      setFound((current) =>
-                        current.map((item, itemIndex) =>
-                          itemIndex === index
-                            ? { ...item, selected: checked }
-                            : checked &&
-                                entry.choice_group &&
-                                item.choice_group === entry.choice_group
-                              ? { ...item, selected: false }
-                            : item
-                        )
-                      );
-                    }}
-                  />
-                  <span className="found-details">
-                    <strong>{entryTitle(entry)}</strong>
-                    <small className="link-line">
-                      <span className="link-kind">{entry.kind || "link"}</span>
-                      {compactUrl(entry.webpage_url || entry.url)}
-                    </small>
-                  </span>
-                  <div className="found-actions">
-                    {entry.resolutions.length > 0 && (
-                      <select
-                        className="resolution-select"
-                        value={entry.resolution ?? "best"}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setFound((current) =>
-                            current.map((item, itemIndex) =>
-                              itemIndex === index
-                                ? {
-                                    ...item,
-                                    resolution:
-                                      value === "best" ? null : Number(value)
-                                  }
-                                : item
+              {foundGroups.map((group) => {
+                const selectedInGroup = group.entries.filter(
+                  (entry) => entry.selected
+                ).length;
+                return (
+                  <section className="found-group" key={group.id}>
+                    <div className="found-group-head">
+                      <div className="found-group-title">
+                        <h3>{group.title}</h3>
+                        <small>{compactUrl(group.sourcePage)}</small>
+                        <span>
+                          {selectedInGroup} de {group.entries.length} fuente(s) elegida(s)
+                        </span>
+                      </div>
+                      <div className="found-group-actions">
+                        <button
+                          className="ghost-button compact-button"
+                          onClick={() => addFoundGroup(group.id)}
+                          disabled={!selectedInGroup}
+                          title="Agregar este contenido a la cola"
+                        >
+                          <Plus size={16} />
+                          Agregar
+                        </button>
+                        <button
+                          className="primary-button compact-button"
+                          onClick={() => void downloadFoundGroup(group.id)}
+                          disabled={!selectedInGroup || isRunning}
+                          title="Descargar este contenido"
+                        >
+                          <Download size={16} />
+                          Descargar
+                        </button>
+                        <button
+                          className="icon-button danger compact-icon-button"
+                          onClick={() => removeFoundGroup(group.id)}
+                          title="Eliminar este contenido"
+                          aria-label={`Eliminar ${group.title}`}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="found-options">
+                      {group.entries.map((entry) => (
+                        <div className="found-row" key={entry.url}>
+                          <input
+                            type={group.entries.length > 1 ? "radio" : "checkbox"}
+                            name={group.entries.length > 1 ? `source-${group.id}` : undefined}
+                            aria-label={`Seleccionar ${entryTitle(entry)}`}
+                            checked={entry.selected}
+                            onChange={(event) => {
+                              const checked = event.target.checked;
+                              setFound((current) =>
+                                current.map((item) =>
+                                  item.groupId === entry.groupId && item.url === entry.url
+                                    ? { ...item, selected: checked }
+                                    : checked && item.groupId === entry.groupId
+                                      ? { ...item, selected: false }
+                                      : item
+                                )
+                              );
+                            }}
+                          />
+                          <span className="found-details">
+                            <strong>{entryTitle(entry)}</strong>
+                            <small className="link-line">
+                              <span className="link-kind">{entry.kind || "link"}</span>
+                              {compactUrl(entry.webpage_url || entry.url)}
+                            </small>
+                          </span>
+                          <div className="found-actions">
+                            {entry.resolutions.length > 0 && (
+                              <select
+                                className="resolution-select"
+                                value={entry.resolution ?? "best"}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  setFound((current) =>
+                                    current.map((item) =>
+                                      item.groupId === entry.groupId && item.url === entry.url
+                                        ? {
+                                            ...item,
+                                            resolution:
+                                              value === "best" ? null : Number(value)
+                                          }
+                                        : item
+                                    )
+                                  );
+                                }}
+                                title="Resolucion de descarga"
+                              >
+                                <option value="best">Mejor disponible</option>
+                                {entry.resolutions.map((height) => (
+                                  <option value={height} key={height}>
+                                    {height}p
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                            <button
+                              className="icon-button danger compact-icon-button"
+                              onClick={() =>
+                                setFound((current) =>
+                                  current.filter(
+                                    (item) =>
+                                      item.groupId !== entry.groupId || item.url !== entry.url
+                                  )
+                                )
+                              }
+                              title="Eliminar fuente"
+                              aria-label={`Eliminar ${entryTitle(entry)}`}
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                );
+              })}
+              {detectionFailures.map((failure) => {
+                const retrying = retryingSources.has(failure.url);
+                return (
+                  <section className="found-group detection-failure" key={failure.url}>
+                    <div className="found-group-head">
+                      <div className="found-group-title">
+                        <h3>{compactUrl(failure.url)}</h3>
+                        <small>{failure.url}</small>
+                        <span>No se pudo detectar. Los demas continuan normalmente.</span>
+                      </div>
+                      <div className="found-group-actions">
+                        <button
+                          className="ghost-button compact-button"
+                          onClick={() => void retryFailedSource(failure)}
+                          disabled={retrying || isProbing}
+                          title="Volver a detectar este enlace"
+                        >
+                          <RefreshCw size={16} className={retrying ? "spin" : undefined} />
+                          Reintentar
+                        </button>
+                        <button
+                          className="icon-button danger compact-icon-button"
+                          onClick={() =>
+                            setDetectionFailures((current) =>
+                              current.filter((entry) => entry.url !== failure.url)
                             )
-                          );
-                        }}
-                        title="Resolucion de descarga"
-                      >
-                        <option value="best">Mejor disponible</option>
-                        {entry.resolutions.map((height) => (
-                          <option value={height} key={height}>
-                            {height}p
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                    <button
-                      className="icon-button danger compact-icon-button"
-                      onClick={() =>
-                        setFound((current) =>
-                          current.filter((_, itemIndex) => itemIndex !== index)
-                        )
-                      }
-                      title="Eliminar detectado"
-                      aria-label={`Eliminar ${entryTitle(entry)}`}
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                </div>
-              ))}
+                          }
+                          title="Quitar enlace fallido"
+                          aria-label={`Quitar ${failure.url}`}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    </div>
+                    <p className="failure-message">{failure.error}</p>
+                  </section>
+                );
+              })}
             </div>
           </section>
         )}

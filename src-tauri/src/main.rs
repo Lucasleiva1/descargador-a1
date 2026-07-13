@@ -566,11 +566,16 @@ fn player_entries(data: &Value, choice_group: Option<&str>) -> Vec<ProbeEntry> {
                 .and_then(Value::as_str)
                 .map(clean_label)
                 .filter(|value| !value.is_empty());
-            let label = [Some(host.to_string()), quality, language]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" - ");
+            let label = [
+                Some(host.to_string()),
+                source_format_label(&url),
+                quality,
+                language,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" - ");
             let url = url.to_string();
             entries.push(ProbeEntry {
                 id: None,
@@ -613,6 +618,19 @@ fn source_preference(raw_url: &str) -> u8 {
         3
     } else {
         10
+    }
+}
+
+fn source_format_label(url: &Url) -> Option<String> {
+    let path = url.path().to_ascii_lowercase();
+    if path.contains(".rar/") || path.ends_with(".rar") {
+        Some("RAR - requiere extraer".to_string())
+    } else if path.ends_with(".mkv") {
+        Some("Video MKV".to_string())
+    } else if path.ends_with(".mp4") {
+        Some("Video MP4".to_string())
+    } else {
+        None
     }
 }
 
@@ -1312,60 +1330,72 @@ async fn download_mediafire_file(
     let mut last_update = Instant::now();
     let mut downloaded = 0_u64;
 
-    loop {
-        if cancellation.is_cancelled() {
-            return Err("Descarga detenida.".to_string());
-        }
-        let chunk = tokio::select! {
-            _ = cancellation.notify.notified() => return Err("Descarga detenida.".to_string()),
-            result = response.chunk() => result
-                .map_err(|error| format!("Se interrumpio la transferencia: {error}"))?,
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        file.write_all(&chunk)
-            .map_err(|error| format!("No pude escribir el archivo: {error}"))?;
-        downloaded += chunk.len() as u64;
+    let transfer_result: Result<(), String> = async {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err("Descarga detenida.".to_string());
+            }
+            let chunk = tokio::select! {
+                _ = cancellation.notify.notified() => Err("Descarga detenida.".to_string()),
+                result = response.chunk() => result
+                    .map_err(|error| format!("Se interrumpio la transferencia: {error}")),
+            }?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            file.write_all(&chunk)
+                .map_err(|error| format!("No pude escribir el archivo: {error}"))?;
+            downloaded += chunk.len() as u64;
 
-        if last_update.elapsed() >= Duration::from_millis(350) {
-            let elapsed = started.elapsed().as_secs_f64().max(0.1);
-            let bytes_per_second = downloaded as f64 / elapsed;
-            let progress = if total > 0 {
-                downloaded as f64 * 100.0 / total as f64
-            } else {
-                0.0
-            };
-            let eta = if total > downloaded && bytes_per_second > 0.0 {
-                Some(format_duration(
-                    ((total - downloaded) as f64 / bytes_per_second) as u64,
-                ))
-            } else {
-                None
-            };
-            publish_update(
-                app,
-                &updates,
-                DownloadUpdate {
-                    id: job.id.clone(),
-                    status: "downloading".to_string(),
-                    progress: Some(progress.min(99.9)),
-                    speed: Some(format!("{}/s", format_bytes(bytes_per_second as u64))),
-                    eta,
-                    file: None,
-                    message: Some(format!(
-                        "MediaFire: {}",
-                        final_path.file_name().unwrap_or_default().to_string_lossy()
-                    )),
-                },
-            )
-            .await;
-            last_update = Instant::now();
+            if last_update.elapsed() >= Duration::from_millis(350) {
+                let elapsed = started.elapsed().as_secs_f64().max(0.1);
+                let bytes_per_second = downloaded as f64 / elapsed;
+                let progress = if total > 0 {
+                    downloaded as f64 * 100.0 / total as f64
+                } else {
+                    0.0
+                };
+                let eta = if total > downloaded && bytes_per_second > 0.0 {
+                    Some(format_duration(
+                        ((total - downloaded) as f64 / bytes_per_second) as u64,
+                    ))
+                } else {
+                    None
+                };
+                publish_update(
+                    app,
+                    &updates,
+                    DownloadUpdate {
+                        id: job.id.clone(),
+                        status: "downloading".to_string(),
+                        progress: Some(progress.min(99.9)),
+                        speed: Some(format!("{}/s", format_bytes(bytes_per_second as u64))),
+                        eta,
+                        file: None,
+                        message: Some(format!(
+                            "MediaFire: {}",
+                            final_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                    },
+                )
+                .await;
+                last_update = Instant::now();
+            }
         }
+        Ok(())
     }
+    .await;
 
-    file.flush()
-        .map_err(|error| format!("No pude terminar de escribir el archivo: {error}"))?;
+    if let Err(error) = transfer_result {
+        drop(file);
+        let _ = fs::remove_file(&part_path);
+        return Err(error);
+    }
+    if let Err(error) = file.flush() {
+        drop(file);
+        let _ = fs::remove_file(&part_path);
+        return Err(format!("No pude terminar de escribir el archivo: {error}"));
+    }
     drop(file);
     fs::rename(&part_path, &final_path)
         .map_err(|error| format!("No pude completar el archivo descargado: {error}"))?;
@@ -2552,6 +2582,7 @@ fn clean_process_error(stderr: &[u8], fallback: &str) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(DownloadState::default())
@@ -2644,6 +2675,18 @@ mod tests {
             source_preference("https://www.mediafire.com/file/a")
                 < source_preference("https://mega.nz/file/a")
         );
+    }
+
+    #[test]
+    fn archive_sources_are_labeled_before_download() {
+        let rar = Url::parse("https://mediafire.com/file/movie.rar/file").unwrap();
+        let video = Url::parse("https://cdn.example.com/movie.mkv").unwrap();
+
+        assert_eq!(
+            source_format_label(&rar).as_deref(),
+            Some("RAR - requiere extraer")
+        );
+        assert_eq!(source_format_label(&video).as_deref(), Some("Video MKV"));
     }
 
     #[test]

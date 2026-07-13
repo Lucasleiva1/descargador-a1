@@ -1,1 +1,1 @@
-{"main-capability":{"identifier":"main-capability","description":"Permisos de la ventana principal de Descargador A1","local":true,"windows":["main"],"permissions":["core:default","updater:default","process:allow-restart"]}}
+{"main-capability":{"identifier":"main-capability","description":"Permisos de la ventana principal de Descargador A1","local":true,"windows":["main"],"permissions":["core:default","clipboard-manager:allow-read-text","updater:default","process:allow-restart"]}}

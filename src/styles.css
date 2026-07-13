@@ -220,6 +220,33 @@ h1 {
   gap: 8px;
 }
 
+.field-label-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.paste-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.paste-button:hover {
+  border-color: rgba(33, 199, 183, 0.6);
+  color: var(--teal);
+}
+
 .clear-input-button {
   display: inline-grid;
   width: 28px;
@@ -423,10 +450,104 @@ button:disabled {
 
 .found-list {
   display: grid;
-  gap: 8px;
-  max-height: 320px;
+  gap: 18px;
+  max-height: 520px;
   overflow: auto;
   padding-right: 3px;
+}
+
+.found-group {
+  display: grid;
+  gap: 10px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.found-group:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.detection-failure {
+  padding: 12px;
+  border: 1px solid rgba(255, 107, 97, 0.5);
+  border-radius: 8px;
+  background: rgba(255, 107, 97, 0.08);
+}
+
+.detection-failure:last-child {
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 107, 97, 0.5);
+}
+
+.detection-failure .found-group-title span {
+  color: var(--red);
+}
+
+.failure-message {
+  max-height: 76px;
+  margin: 0;
+  overflow: auto;
+  color: #ffaaa3;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.found-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.found-group-title {
+  min-width: 0;
+}
+
+.found-group-title h3,
+.found-group-title small,
+.found-group-title span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.found-group-title h3 {
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.found-group-title small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.found-group-title span {
+  margin-top: 4px;
+  color: var(--teal);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.found-group-actions,
+.found-options {
+  display: flex;
+}
+
+.found-group-actions {
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.found-options {
+  flex-direction: column;
+  gap: 7px;
 }
 
 .found-row {
@@ -952,6 +1073,7 @@ button:disabled {
   .tool-strip,
   .toolbar,
   .mini-actions,
+  .found-group-actions,
   .queue-actions {
     justify-content: flex-start;
     flex-wrap: wrap;
@@ -967,6 +1089,11 @@ button:disabled {
 
   .status-pill {
     width: fit-content;
+  }
+
+  .found-group-head {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .found-row {

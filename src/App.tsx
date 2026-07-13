@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   AlertCircle,
   CheckCircle2,
@@ -21,7 +24,7 @@ import {
   XCircle
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type DownloadStatus =
   | "pending"
@@ -54,6 +57,7 @@ type ProbeEntry = {
   duration?: string;
   kind?: string;
   source?: string;
+  choice_group?: string;
   resolutions: number[];
 };
 
@@ -111,6 +115,13 @@ type YoutubeSessionState = {
 type QueueConfirmation = {
   action: "stop" | "delete";
   item: QueueItem;
+};
+
+type UpdateState = {
+  status: "idle" | "checking" | "available" | "downloading" | "current" | "error";
+  version?: string;
+  progress: number;
+  message: string;
 };
 
 const statusCopy: Record<DownloadStatus, string> = {
@@ -176,6 +187,8 @@ function compactUrl(url: string) {
 }
 
 export function App() {
+  const sourceInputRef = useRef<HTMLTextAreaElement>(null);
+  const availableUpdate = useRef<Update | null>(null);
   const [sourceText, setSourceText] = useState("");
   const [referer, setReferer] = useState("");
   const [browser, setBrowser] = useState("app");
@@ -188,6 +201,10 @@ export function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [isProbing, setIsProbing] = useState(false);
+  const [downloadConcurrency, setDownloadConcurrency] = useState(() => {
+    const stored = Number(localStorage.getItem("descargador-a1-concurrency"));
+    return [1, 2, 3, 4, 5, 10].includes(stored) ? stored : 1;
+  });
   const [isRunning, setIsRunning] = useState(false);
   const [notice, setNotice] = useState("");
   const [confirmation, setConfirmation] = useState<QueueConfirmation | null>(
@@ -195,6 +212,12 @@ export function App() {
   );
   const [isConfirming, setIsConfirming] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [appVersion, setAppVersion] = useState("1.0.0");
+  const [updateState, setUpdateState] = useState<UpdateState>({
+    status: "idle",
+    progress: 0,
+    message: "Busca nuevas versiones publicadas en GitHub."
+  });
   const [uiScale, setUiScale] = useState(() => {
     const stored = Number(localStorage.getItem("descargador-a1-ui-scale"));
     return stored >= 75 && stored <= 125 ? stored : 100;
@@ -217,6 +240,11 @@ export function App() {
   useEffect(() => {
     refreshTools();
     refreshYoutubeSession();
+    getVersion().then(setAppVersion).catch(() => undefined);
+
+    const updateTimer = window.setTimeout(() => {
+      void checkForUpdates(true);
+    }, 1800);
 
     let unlistenJob: (() => void) | undefined;
     let unlistenBatch: (() => void) | undefined;
@@ -270,11 +298,93 @@ export function App() {
     const pollTimer = window.setInterval(pollDownloadState, 750);
 
     return () => {
+      window.clearTimeout(updateTimer);
       window.clearInterval(pollTimer);
       unlistenJob?.();
       unlistenBatch?.();
     };
   }, []);
+
+  async function checkForUpdates(silent = false) {
+    setUpdateState((current) => ({
+      ...current,
+      status: "checking",
+      progress: 0,
+      message: "Buscando actualizaciones..."
+    }));
+    try {
+      const update = await check({ timeout: 15000 });
+      availableUpdate.current = update;
+      if (!update) {
+        setUpdateState({
+          status: "current",
+          progress: 100,
+          message: `Descargador A1 v${appVersion} esta actualizado.`
+        });
+        return;
+      }
+
+      setUpdateState({
+        status: "available",
+        version: update.version,
+        progress: 0,
+        message: update.body || `Version ${update.version} disponible.`
+      });
+      if (silent) {
+        setNotice(`Actualizacion ${update.version} disponible.`);
+      }
+    } catch (error) {
+      availableUpdate.current = null;
+      setUpdateState({
+        status: "error",
+        progress: 0,
+        message: `No pude consultar actualizaciones: ${String(error)}`
+      });
+    }
+  }
+
+  async function installAvailableUpdate() {
+    let update = availableUpdate.current;
+    if (!update) {
+      await checkForUpdates();
+      update = availableUpdate.current;
+    }
+    if (!update) return;
+
+    let downloaded = 0;
+    let total = 0;
+    setUpdateState((current) => ({
+      ...current,
+      status: "downloading",
+      progress: 0,
+      message: `Descargando version ${update.version}...`
+    }));
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          const progress = total > 0 ? (downloaded / total) * 100 : 0;
+          setUpdateState((current) => ({ ...current, progress }));
+        } else if (event.event === "Finished") {
+          setUpdateState((current) => ({
+            ...current,
+            progress: 100,
+            message: "Actualizacion instalada. Reiniciando..."
+          }));
+        }
+      });
+      await relaunch();
+    } catch (error) {
+      setUpdateState({
+        status: "error",
+        version: update.version,
+        progress: 0,
+        message: `No pude instalar la actualizacion: ${String(error)}`
+      });
+    }
+  }
 
   useEffect(() => {
     document.documentElement.style.setProperty(
@@ -283,6 +393,13 @@ export function App() {
     );
     localStorage.setItem("descargador-a1-ui-scale", String(uiScale));
   }, [uiScale]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "descargador-a1-concurrency",
+      String(downloadConcurrency)
+    );
+  }, [downloadConcurrency]);
 
   useEffect(() => {
     if (!confirmation) return;
@@ -355,8 +472,9 @@ export function App() {
   }
 
   async function probeSource() {
-    const url = extractUrls(sourceText)[0] ?? sourceText.trim();
-    if (!url) {
+    const extracted = extractUrls(sourceText);
+    const urls = extracted.length ? extracted : [sourceText.trim()];
+    if (!urls[0]) {
       setNotice("Pega una URL para buscar.");
       return;
     }
@@ -364,50 +482,94 @@ export function App() {
     setIsProbing(true);
     setNotice("");
     try {
-      let result: ProbeResult;
-      let mode = "yt-dlp";
+      const detected: FoundEntry[] = [];
+      const seen = new Set<string>();
+      const selectedGroups = new Set<string>();
+      const errors: string[] = [];
 
-      try {
-        result = await invoke<ProbeResult>("probe_url", {
-          url,
-          browser: browser === "none" ? null : browser
-        });
-      } catch (extractorError) {
-        mode = "escaneo";
+      for (const [urlIndex, url] of urls.entries()) {
+        let result: ProbeResult;
         try {
-          result = await invoke<ProbeResult>("scan_page", {
-            url,
-            referer: referer.trim() || null
-          });
-        } catch (scanError) {
-          throw new Error(
-            `yt-dlp: ${String(extractorError)} | Escaneo: ${String(scanError)}`
+          try {
+            result = await invoke<ProbeResult>("probe_url", {
+              url,
+              browser: browser === "none" ? null : browser
+            });
+          } catch (extractorError) {
+            if (String(extractorError).includes("Busqueda detenida")) {
+              throw extractorError;
+            }
+            try {
+              result = await invoke<ProbeResult>("scan_page", {
+                url,
+                referer: referer.trim() || null
+              });
+            } catch (scanError) {
+              if (String(scanError).includes("Busqueda detenida")) {
+                throw scanError;
+              }
+              throw new Error(
+                `yt-dlp: ${String(extractorError)} | Escaneo: ${String(scanError)}`
+              );
+            }
+            if (!referer.trim()) setReferer(url);
+          }
+
+          for (const entry of result.entries) {
+            const key = entry.webpage_url || entry.url;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const choiceGroup = entry.choice_group;
+            const selected = !choiceGroup || !selectedGroups.has(choiceGroup);
+            if (choiceGroup && selected) selectedGroups.add(choiceGroup);
+            detected.push({
+              ...entry,
+              resolutions: entry.resolutions ?? [],
+              selected,
+              resolution: null
+            });
+          }
+          setNotice(
+            `Buscando ${urlIndex + 1} de ${urls.length}...`
           );
-        }
-        if (!referer.trim()) {
-          setReferer(url);
+        } catch (error) {
+          if (String(error).includes("Busqueda detenida")) throw error;
+          errors.push(`${compactUrl(url)}: ${String(error)}`);
         }
       }
 
-      setFound(
-        result.entries.map((entry) => ({
-          ...entry,
-          resolutions: entry.resolutions ?? [],
-          selected: true,
-          resolution: null
-        }))
-      );
+      setFound(detected);
+      if (!detected.length && errors.length) {
+        throw new Error(errors.join(" | "));
+      }
       setNotice(
-        result.entries.length === 1
-          ? `Se encontro 1 entrada con ${mode}.`
-          : `Se encontraron ${result.entries.length} entradas con ${mode}.`
+        `${detected.length} entrada(s) detectada(s)` +
+          (errors.length ? ` - ${errors.length} URL(s) con error.` : ".")
       );
     } catch (error) {
-      setNotice(String(error));
-      setFound([]);
+      if (String(error).includes("Busqueda detenida")) {
+        setNotice("Busqueda detenida.");
+      } else {
+        setNotice(String(error));
+        setFound([]);
+      }
     } finally {
       setIsProbing(false);
     }
+  }
+
+  async function stopProbe() {
+    setNotice("Deteniendo busqueda...");
+    try {
+      await invoke("cancel_search");
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  function clearSource() {
+    setSourceText("");
+    window.requestAnimationFrame(() => sourceInputRef.current?.focus());
   }
 
   function addUrlsFromText() {
@@ -532,7 +694,8 @@ export function App() {
         jobs,
         outputDir: outputDir.trim() || null,
         referer: referer.trim() || null,
-        browser: browser === "none" ? null : browser
+        browser: browser === "none" ? null : browser,
+        concurrency: downloadConcurrency
       });
       setIsRunning(true);
     } catch (error) {
@@ -658,29 +821,41 @@ export function App() {
             <Link2 size={18} />
           </div>
 
-          <label className="field">
-            <span>URL o lista</span>
+          <div className="field">
+            <div className="field-label-row">
+              <span>URL o lista</span>
+              <button
+                className="clear-input-button"
+                onClick={clearSource}
+                disabled={!sourceText}
+                title="Limpiar URL"
+                aria-label="Limpiar URL"
+              >
+                <X size={15} />
+              </button>
+            </div>
             <textarea
+              ref={sourceInputRef}
+              aria-label="URL o lista"
               value={sourceText}
               onChange={(event) => setSourceText(event.target.value)}
               placeholder="https://..."
               rows={7}
             />
-          </label>
+          </div>
 
           <div className="action-grid">
             <button
-              className="primary-button"
-              onClick={probeSource}
-              disabled={isProbing}
-              title="Buscar links"
+              className={isProbing ? "ghost-button stop-button" : "primary-button"}
+              onClick={isProbing ? stopProbe : probeSource}
+              title={isProbing ? "Detener busqueda" : "Buscar links"}
             >
               {isProbing ? (
-                <Loader2 size={17} className="spin" />
+                <Square size={16} />
               ) : (
                 <Search size={17} />
               )}
-              Buscar
+              {isProbing ? "Detener busqueda" : "Buscar"}
             </button>
               <button
                 className="ghost-button"
@@ -757,7 +932,12 @@ export function App() {
             <div className="panel-head compact">
               <div>
                 <h2>Detectados</h2>
-                <p className="found-count">{selectedFound.length} seleccionados</p>
+                <p className="found-count">
+                  {selectedFound.length} seleccionados
+                  {found.some((entry) => entry.choice_group)
+                    ? " - una fuente por contenido"
+                    : ""}
+                </p>
               </div>
               <div className="mini-actions">
                 <button
@@ -785,7 +965,8 @@ export function App() {
               {found.map((entry, index) => (
                 <div className="found-row" key={`${entry.url}-${index}`}>
                   <input
-                    type="checkbox"
+                    type={entry.choice_group ? "radio" : "checkbox"}
+                    name={entry.choice_group ? `source-${entry.choice_group}` : undefined}
                     aria-label={`Seleccionar ${entryTitle(entry)}`}
                     checked={entry.selected}
                     onChange={(event) => {
@@ -794,6 +975,10 @@ export function App() {
                         current.map((item, itemIndex) =>
                           itemIndex === index
                             ? { ...item, selected: checked }
+                            : checked &&
+                                entry.choice_group &&
+                                item.choice_group === entry.choice_group
+                              ? { ...item, selected: false }
                             : item
                         )
                       );
@@ -865,6 +1050,22 @@ export function App() {
             </div>
 
             <div className="toolbar">
+              <label className="concurrency-control">
+                <span>Simultaneas</span>
+                <select
+                  value={downloadConcurrency}
+                  onChange={(event) =>
+                    setDownloadConcurrency(Number(event.target.value))
+                  }
+                  disabled={isRunning}
+                >
+                  {[1, 2, 3, 4, 5, 10].map((value) => (
+                    <option value={value} key={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button
                 className="primary-button"
                 onClick={startQueue}
@@ -972,6 +1173,47 @@ export function App() {
               <Settings2 size={22} />
             </div>
             <h2 id="settings-title">Configuracion</h2>
+
+            <div className="update-control">
+              <span className="setting-heading">
+                <strong>Actualizaciones</strong>
+                <output>v{appVersion}</output>
+              </span>
+              <p>{updateState.message}</p>
+              {updateState.status === "downloading" && (
+                <progress max="100" value={updateState.progress} />
+              )}
+              <button
+                className={
+                  updateState.status === "available"
+                    ? "primary-button"
+                    : "ghost-button"
+                }
+                onClick={() =>
+                  updateState.status === "available"
+                    ? void installAvailableUpdate()
+                    : void checkForUpdates()
+                }
+                disabled={
+                  updateState.status === "checking" ||
+                  updateState.status === "downloading"
+                }
+              >
+                {updateState.status === "checking" ||
+                updateState.status === "downloading" ? (
+                  <Loader2 size={17} className="spin" />
+                ) : updateState.status === "available" ? (
+                  <Download size={17} />
+                ) : (
+                  <RefreshCw size={17} />
+                )}
+                {updateState.status === "available"
+                  ? `Instalar v${updateState.version}`
+                  : updateState.status === "downloading"
+                    ? "Instalando..."
+                    : "Buscar actualizaciones"}
+              </button>
+            </div>
 
             <label className="scale-control">
               <span>

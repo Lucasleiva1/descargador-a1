@@ -213,6 +213,31 @@ h1 {
   text-transform: uppercase;
 }
 
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.clear-input-button {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.clear-input-button:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
 .session-controls {
   display: grid;
   grid-template-columns: minmax(150px, 1fr) auto auto;
@@ -503,6 +528,23 @@ button:disabled {
   gap: 8px;
 }
 
+.concurrency-control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.concurrency-control select {
+  width: 62px;
+  min-height: 38px;
+  padding: 0 8px;
+}
+
 .notice {
   gap: 8px;
   min-height: 40px;
@@ -753,6 +795,45 @@ button:disabled {
   color: var(--teal);
   border-color: rgba(33, 199, 183, 0.36);
   background: rgba(33, 199, 183, 0.12);
+}
+
+.update-control {
+  display: grid;
+  gap: 10px;
+  margin-top: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.setting-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.setting-heading strong {
+  font-size: 14px;
+}
+
+.setting-heading output {
+  color: var(--teal);
+  font-weight: 800;
+}
+
+.update-control p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-control progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--teal);
+}
+
+.update-control button {
+  width: 100%;
 }
 
 .scale-control {

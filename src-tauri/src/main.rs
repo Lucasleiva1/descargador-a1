@@ -5,19 +5,20 @@ use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
+    io::Write,
     path::PathBuf,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, Semaphore},
 };
 use url::Url;
 
@@ -31,6 +32,13 @@ struct DownloadState {
     active: Arc<AtomicBool>,
     jobs: Arc<Mutex<HashMap<String, Arc<JobCancellation>>>>,
     updates: Arc<Mutex<HashMap<String, DownloadUpdate>>>,
+}
+
+#[derive(Default)]
+struct SearchState {
+    cancelled: AtomicBool,
+    process_id: Mutex<Option<u32>>,
+    notify: Notify,
 }
 
 #[derive(Default)]
@@ -75,6 +83,7 @@ struct ProbeEntry {
     duration: Option<String>,
     kind: Option<String>,
     source: Option<String>,
+    choice_group: Option<String>,
     resolutions: Vec<u32>,
 }
 
@@ -257,8 +266,31 @@ fn get_youtube_session(app: AppHandle) -> YoutubeSessionState {
 }
 
 #[tauri::command]
+async fn cancel_search(search: State<'_, SearchState>) -> Result<bool, String> {
+    search.cancelled.store(true, Ordering::SeqCst);
+    search.notify.notify_waiters();
+    let process_id = search.process_id.lock().await.take();
+
+    if let Some(process_id) = process_id {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &process_id.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+#[tauri::command]
 async fn probe_url(
     app: AppHandle,
+    search: State<'_, SearchState>,
     url: String,
     browser: Option<String>,
 ) -> Result<ProbeResult, String> {
@@ -268,6 +300,11 @@ async fn probe_url(
     }
 
     let yt_dlp = locate_yt_dlp(&app)?;
+    search.cancelled.store(false, Ordering::SeqCst);
+    if search.process_id.lock().await.is_some() {
+        return Err("Ya hay una busqueda activa.".to_string());
+    }
+
     let mut args = vec![
         "--dump-single-json".to_string(),
         "--no-color".to_string(),
@@ -277,18 +314,32 @@ async fn probe_url(
         "--retries".to_string(),
         "3".to_string(),
     ];
+    if is_single_video_url(&url) {
+        args.push("--no-playlist".to_string());
+    }
     append_runtime_args(&mut args);
     append_managed_session_args(&app, &mut args, browser.as_deref())?;
     append_browser_args(&mut args, browser.as_deref())?;
     args.push(url.clone());
 
-    let output = Command::new(&yt_dlp)
+    let mut command = Command::new(&yt_dlp);
+    command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
         .map_err(|error| format!("No pude ejecutar yt-dlp: {error}"))?;
+    let process_id = child.id();
+    *search.process_id.lock().await = process_id;
+    let output = child.wait_with_output().await;
+    *search.process_id.lock().await = None;
+    let output = output.map_err(|error| format!("No pude esperar a yt-dlp: {error}"))?;
+
+    if search.cancelled.load(Ordering::SeqCst) {
+        return Err("Busqueda detenida.".to_string());
+    }
 
     if !output.status.success() {
         return Err(clean_process_error(
@@ -305,7 +356,11 @@ async fn probe_url(
 }
 
 #[tauri::command]
-async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, String> {
+async fn scan_page(
+    search: State<'_, SearchState>,
+    url: String,
+    referer: Option<String>,
+) -> Result<ProbeResult, String> {
     let parsed_url = Url::parse(url.trim())
         .map_err(|error| format!("No pude interpretar esa URL para escanear la pagina: {error}"))?;
 
@@ -317,13 +372,14 @@ async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, 
         .build()
         .map_err(|error| format!("No pude preparar el escaner: {error}"))?;
 
-    let (final_url, html) = fetch_html(
+    let (final_url, html) = cancellable_fetch_html(
         &client,
         &parsed_url,
         referer
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty()),
+        &search,
     )
     .await?;
 
@@ -334,12 +390,28 @@ async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, 
         .map(|entry| entry.url.clone())
         .collect::<HashSet<_>>();
 
-    if let Some(rendered_html) = render_page(&final_url).await {
+    match discover_dynamic_player_candidates(&client, &final_url, &html, &search).await {
+        Ok(dynamic_entries) => {
+            for entry in dynamic_entries {
+                if seen.insert(entry.url.clone()) {
+                    entries.push(entry);
+                }
+            }
+        }
+        Err(error) if search.cancelled.load(Ordering::SeqCst) => return Err(error),
+        Err(_) => {}
+    }
+
+    if let Some(rendered_html) = render_page(&final_url, &search).await {
         for entry in extract_page_candidates(&final_url, &rendered_html) {
             if seen.insert(entry.url.clone()) {
                 entries.push(entry);
             }
         }
+    }
+
+    if search.cancelled.load(Ordering::SeqCst) {
+        return Err("Busqueda detenida.".to_string());
     }
 
     let follow_targets = entries
@@ -352,8 +424,11 @@ async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, 
         tokio::time::sleep(Duration::from_millis(FOLLOW_DELAY_MS)).await;
 
         let Ok((detail_url, detail_html)) =
-            fetch_html(&client, &target, Some(final_url.as_str())).await
+            cancellable_fetch_html(&client, &target, Some(final_url.as_str()), &search).await
         else {
+            if search.cancelled.load(Ordering::SeqCst) {
+                return Err("Busqueda detenida.".to_string());
+            }
             continue;
         };
 
@@ -377,7 +452,217 @@ async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, 
     })
 }
 
-async fn render_page(url: &Url) -> Option<String> {
+async fn discover_dynamic_player_candidates(
+    client: &reqwest::Client,
+    page_url: &Url,
+    html: &str,
+    search: &SearchState,
+) -> Result<Vec<ProbeEntry>, String> {
+    let fast_api_regex =
+        Regex::new(r#"fastApi\s*:\s*['\"]([^'\"]+)['\"]"#).map_err(|error| error.to_string())?;
+    let Some(capture) = fast_api_regex.captures(html) else {
+        return Ok(Vec::new());
+    };
+    let Some(base_match) = capture.get(1) else {
+        return Ok(Vec::new());
+    };
+    let base = Url::parse(&format!("{}/", base_match.as_str().trim_end_matches('/')))
+        .map_err(|error| error.to_string())?;
+    if !matches!(base.scheme(), "http" | "https") || base.host_str() != page_url.host_str() {
+        return Ok(Vec::new());
+    }
+
+    let Some(slug) = page_url
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut post_id = None;
+    for post_type in ["movies", "tvshows", "animes"] {
+        let mut endpoint = base
+            .join(&format!("single/{post_type}"))
+            .map_err(|error| error.to_string())?;
+        endpoint
+            .query_pairs_mut()
+            .append_pair("slug", slug)
+            .append_pair("postType", post_type);
+
+        let Ok(response) = cancellable_fetch_json(client, &endpoint, page_url, search).await else {
+            if search.cancelled.load(Ordering::SeqCst) {
+                return Err("Busqueda detenida.".to_string());
+            }
+            continue;
+        };
+        let data = response.get("data").unwrap_or(&response);
+        post_id = value_identifier(data.get("_id"));
+        if post_id.is_some() {
+            break;
+        }
+    }
+
+    let Some(post_id) = post_id else {
+        return Ok(Vec::new());
+    };
+    let mut player_endpoint = base.join("player").map_err(|error| error.to_string())?;
+    player_endpoint
+        .query_pairs_mut()
+        .append_pair("postId", &post_id)
+        .append_pair("demo", "0");
+    let response = cancellable_fetch_json(client, &player_endpoint, page_url, search).await?;
+    let data = response.get("data").unwrap_or(&response);
+
+    Ok(player_entries(data, Some(page_url.as_str())))
+}
+
+fn player_entries(data: &Value, choice_group: Option<&str>) -> Vec<ProbeEntry> {
+    let mut entries = Vec::new();
+    let has_downloads = data
+        .get("downloads")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
+            })
+        });
+    let fields = if has_downloads {
+        [("downloads", "Fuente de descarga")].as_slice()
+    } else {
+        [("embeds", "Reproductor")].as_slice()
+    };
+
+    for (field, kind) in fields {
+        let Some(items) = data.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let raw_url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .or_else(|| item.as_str());
+            let Some(raw_url) = raw_url else {
+                continue;
+            };
+            let Ok(url) = Url::parse(raw_url) else {
+                continue;
+            };
+            if !matches!(url.scheme(), "http" | "https") {
+                continue;
+            }
+            let host = url
+                .host_str()
+                .unwrap_or("Fuente")
+                .trim_start_matches("www.");
+            let quality = item
+                .get("quality")
+                .and_then(Value::as_str)
+                .map(clean_label)
+                .filter(|value| !value.is_empty());
+            let language = item
+                .get("lang")
+                .and_then(Value::as_str)
+                .map(clean_label)
+                .filter(|value| !value.is_empty());
+            let label = [Some(host.to_string()), quality, language]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" - ");
+            let url = url.to_string();
+            entries.push(ProbeEntry {
+                id: None,
+                title: Some(label),
+                url: url.clone(),
+                webpage_url: Some(url),
+                duration: None,
+                kind: Some((*kind).to_string()),
+                source: Some(
+                    if *field == "downloads" {
+                        "dynamic-download"
+                    } else {
+                        "dynamic-player"
+                    }
+                    .to_string(),
+                ),
+                choice_group: choice_group.map(str::to_string),
+                resolutions: Vec::new(),
+            });
+        }
+    }
+
+    entries.sort_by_key(|entry| source_preference(&entry.url));
+
+    entries
+}
+
+fn source_preference(raw_url: &str) -> u8 {
+    let host = Url::parse(raw_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_lowercase))
+        .unwrap_or_default();
+    if host.contains("mediafire.com") {
+        0
+    } else if host.contains("megaup.net") {
+        1
+    } else if host.contains("mega.nz") {
+        2
+    } else if host.contains("1fichier.com") {
+        3
+    } else {
+        10
+    }
+}
+
+fn value_identifier(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+async fn cancellable_fetch_json(
+    client: &reqwest::Client,
+    url: &Url,
+    referer: &Url,
+    search: &SearchState,
+) -> Result<Value, String> {
+    if search.cancelled.load(Ordering::SeqCst) {
+        return Err("Busqueda detenida.".to_string());
+    }
+
+    let request = async {
+        let response = client
+            .get(url.clone())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::REFERER, referer.as_str())
+            .send()
+            .await
+            .map_err(|error| format!("No pude consultar el reproductor: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "El reproductor respondio con estado HTTP {}.",
+                response.status()
+            ));
+        }
+        let raw = response
+            .text()
+            .await
+            .map_err(|error| format!("No pude leer la respuesta del reproductor: {error}"))?;
+        serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("El reproductor devolvio JSON invalido: {error}"))
+    };
+
+    tokio::select! {
+        result = request => result,
+        _ = search.notify.notified() => Err("Busqueda detenida.".to_string()),
+    }
+}
+
+async fn render_page(url: &Url, search: &SearchState) -> Option<String> {
     let edge = locate_edge()?;
     let profile = std::env::temp_dir().join(format!(
         "descargador-a1-edge-{}-{}",
@@ -404,8 +689,14 @@ async fn render_page(url: &Url) -> Option<String> {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(Duration::from_secs(35), command.output()).await;
+    let child = command.spawn().ok()?;
+    *search.process_id.lock().await = child.id();
+    let output = tokio::time::timeout(Duration::from_secs(35), child.wait_with_output()).await;
+    *search.process_id.lock().await = None;
     let _ = fs::remove_dir_all(profile);
+    if search.cancelled.load(Ordering::SeqCst) {
+        return None;
+    }
     let output = output.ok()?.ok()?;
 
     output
@@ -413,6 +704,22 @@ async fn render_page(url: &Url) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
         .filter(|html| !html.trim().is_empty())
+}
+
+async fn cancellable_fetch_html(
+    client: &reqwest::Client,
+    url: &Url,
+    referer: Option<&str>,
+    search: &SearchState,
+) -> Result<(Url, String), String> {
+    if search.cancelled.load(Ordering::SeqCst) {
+        return Err("Busqueda detenida.".to_string());
+    }
+
+    tokio::select! {
+        result = fetch_html(client, url, referer) => result,
+        _ = search.notify.notified() => Err("Busqueda detenida.".to_string()),
+    }
 }
 
 async fn fetch_html(
@@ -475,6 +782,7 @@ async fn start_download(
     output_dir: Option<String>,
     referer: Option<String>,
     browser: Option<String>,
+    concurrency: Option<usize>,
 ) -> Result<(), String> {
     if jobs.is_empty() {
         return Err("La cola está vacía.".to_string());
@@ -501,6 +809,7 @@ async fn start_download(
 
     let job_controls = state.jobs.clone();
     let updates = state.updates.clone();
+    let concurrency = normalize_concurrency(concurrency);
     {
         let mut controls = job_controls.lock().await;
         let mut current_updates = updates.lock().await;
@@ -530,31 +839,52 @@ async fn start_download(
             },
         );
 
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let mut handles = Vec::with_capacity(jobs.len());
+
         for job in jobs {
-            let cancellation = {
-                let controls = job_controls.lock().await;
-                controls.get(&job.id).cloned()
+            let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                break;
             };
+            let task_app = app.clone();
+            let task_yt_dlp = yt_dlp.clone();
+            let task_output_dir = output_dir.clone();
+            let task_referer = referer.clone();
+            let task_browser = browser.clone();
+            let task_controls = job_controls.clone();
+            let task_updates = updates.clone();
 
-            if let Some(cancellation) = cancellation {
-                if cancellation.is_cancelled() {
-                    emit_cancelled(&app, &updates, &job.id).await;
-                } else {
-                    run_download_job(
-                        &app,
-                        &yt_dlp,
-                        &job,
-                        output_dir.as_ref(),
-                        referer.as_deref(),
-                        browser.as_deref(),
-                        cancellation,
-                        updates.clone(),
-                    )
-                    .await;
+            handles.push(tauri::async_runtime::spawn(async move {
+                let _permit = permit;
+                let cancellation = {
+                    let controls = task_controls.lock().await;
+                    controls.get(&job.id).cloned()
+                };
+
+                if let Some(cancellation) = cancellation {
+                    if cancellation.is_cancelled() {
+                        emit_cancelled(&task_app, &task_updates, &job.id).await;
+                    } else {
+                        run_download_job(
+                            &task_app,
+                            &task_yt_dlp,
+                            &job,
+                            task_output_dir.as_ref(),
+                            task_referer.as_deref(),
+                            task_browser.as_deref(),
+                            cancellation,
+                            task_updates.clone(),
+                        )
+                        .await;
+                    }
                 }
-            }
 
-            job_controls.lock().await.remove(&job.id);
+                task_controls.lock().await.remove(&job.id);
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
 
         active.store(false, Ordering::SeqCst);
@@ -620,6 +950,11 @@ async fn run_download_job(
         },
     )
     .await;
+
+    if is_mediafire_page(&job.url) {
+        run_mediafire_download_job(app, job, output_dir, cancellation, updates).await;
+        return;
+    }
 
     let mut args = vec![
         "--newline".to_string(),
@@ -855,6 +1190,283 @@ async fn terminate_child(child: &mut Child) {
 
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+async fn run_mediafire_download_job(
+    app: &AppHandle,
+    job: &DownloadJob,
+    output_dir: Option<&PathBuf>,
+    cancellation: Arc<JobCancellation>,
+    updates: Arc<Mutex<HashMap<String, DownloadUpdate>>>,
+) {
+    let result =
+        download_mediafire_file(app, job, output_dir, cancellation.clone(), updates.clone()).await;
+
+    match result {
+        Ok(file) => {
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "completed".to_string(),
+                    progress: Some(100.0),
+                    speed: None,
+                    eta: Some("0s".to_string()),
+                    file: Some(file.clone()),
+                    message: Some(format!("Archivo guardado: {file}")),
+                },
+            )
+            .await;
+        }
+        Err(_error) if cancellation.is_cancelled() => {
+            emit_cancelled(app, &updates, &job.id).await;
+        }
+        Err(error) => {
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "failed".to_string(),
+                    progress: None,
+                    speed: None,
+                    eta: None,
+                    file: None,
+                    message: Some(error),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn download_mediafire_file(
+    app: &AppHandle,
+    job: &DownloadJob,
+    output_dir: Option<&PathBuf>,
+    cancellation: Arc<JobCancellation>,
+    updates: Arc<Mutex<HashMap<String, DownloadUpdate>>>,
+) -> Result<String, String> {
+    let page_url =
+        Url::parse(&job.url).map_err(|error| format!("URL de MediaFire invalida: {error}"))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent(SCANNER_USER_AGENT)
+        .build()
+        .map_err(|error| format!("No pude preparar la descarga directa: {error}"))?;
+    let page_response = client
+        .get(page_url.clone())
+        .send()
+        .await
+        .map_err(|error| format!("No pude abrir MediaFire: {error}"))?;
+    if !page_response.status().is_success() {
+        return Err(format!(
+            "MediaFire respondio con estado HTTP {}.",
+            page_response.status()
+        ));
+    }
+    let html = page_response
+        .text()
+        .await
+        .map_err(|error| format!("No pude leer la pagina de MediaFire: {error}"))?;
+    let direct_url = mediafire_download_url(&page_url, &html)
+        .ok_or_else(|| "MediaFire no expuso el boton del archivo.".to_string())?;
+
+    let mut response = client
+        .get(direct_url.clone())
+        .header(reqwest::header::REFERER, page_url.as_str())
+        .send()
+        .await
+        .map_err(|error| format!("No pude iniciar la transferencia de MediaFire: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "El archivo de MediaFire respondio con estado HTTP {}.",
+            response.status()
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.contains("text/html") {
+        return Err("MediaFire devolvio otra pagina en lugar del archivo.".to_string());
+    }
+
+    let total = response.content_length().unwrap_or(0);
+    let file_name = response_filename(&response, &direct_url);
+    let directory = output_dir
+        .cloned()
+        .or_else(|| default_output_dir().map(PathBuf::from))
+        .ok_or_else(|| "No pude determinar la carpeta de salida.".to_string())?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("No pude crear la carpeta de salida: {error}"))?;
+    let final_path = available_output_path(directory.join(file_name));
+    let part_path = PathBuf::from(format!("{}.part", final_path.to_string_lossy()));
+    let mut file = fs::File::create(&part_path)
+        .map_err(|error| format!("No pude crear el archivo temporal: {error}"))?;
+    let started = Instant::now();
+    let mut last_update = Instant::now();
+    let mut downloaded = 0_u64;
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Err("Descarga detenida.".to_string());
+        }
+        let chunk = tokio::select! {
+            _ = cancellation.notify.notified() => return Err("Descarga detenida.".to_string()),
+            result = response.chunk() => result
+                .map_err(|error| format!("Se interrumpio la transferencia: {error}"))?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        file.write_all(&chunk)
+            .map_err(|error| format!("No pude escribir el archivo: {error}"))?;
+        downloaded += chunk.len() as u64;
+
+        if last_update.elapsed() >= Duration::from_millis(350) {
+            let elapsed = started.elapsed().as_secs_f64().max(0.1);
+            let bytes_per_second = downloaded as f64 / elapsed;
+            let progress = if total > 0 {
+                downloaded as f64 * 100.0 / total as f64
+            } else {
+                0.0
+            };
+            let eta = if total > downloaded && bytes_per_second > 0.0 {
+                Some(format_duration(
+                    ((total - downloaded) as f64 / bytes_per_second) as u64,
+                ))
+            } else {
+                None
+            };
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "downloading".to_string(),
+                    progress: Some(progress.min(99.9)),
+                    speed: Some(format!("{}/s", format_bytes(bytes_per_second as u64))),
+                    eta,
+                    file: None,
+                    message: Some(format!(
+                        "MediaFire: {}",
+                        final_path.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                },
+            )
+            .await;
+            last_update = Instant::now();
+        }
+    }
+
+    file.flush()
+        .map_err(|error| format!("No pude terminar de escribir el archivo: {error}"))?;
+    drop(file);
+    fs::rename(&part_path, &final_path)
+        .map_err(|error| format!("No pude completar el archivo descargado: {error}"))?;
+    Ok(final_path.to_string_lossy().to_string())
+}
+
+fn is_mediafire_page(raw_url: &str) -> bool {
+    Url::parse(raw_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "mediafire.com" || host.ends_with(".mediafire.com"))
+}
+
+fn mediafire_download_url(page_url: &Url, html: &str) -> Option<Url> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a#downloadButton[href]").ok()?;
+    let href = document.select(&selector).next()?.value().attr("href")?;
+    page_url.join(href).ok()
+}
+
+fn response_filename(response: &reqwest::Response, url: &Url) -> String {
+    let disposition = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let from_header = disposition.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        key.eq_ignore_ascii_case("filename")
+            .then(|| value.trim_matches(['"', '\'']).to_string())
+    });
+    let candidate = from_header
+        .or_else(|| url.path_segments()?.next_back().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "descarga.bin".to_string());
+    sanitize_filename(&candidate)
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || "<>:\"/\\|?*".contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim_matches([' ', '.'])
+        .to_string();
+    if cleaned.is_empty() {
+        "descarga.bin".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn available_output_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("descarga");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 2..10_000 {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({index}).{extension}"),
+            None => format!("{stem} ({index})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }
 
 async fn emit_cancelled(
@@ -1172,6 +1784,7 @@ fn parse_probe_result(source_url: &str, value: Value) -> ProbeResult {
             duration: duration_string(&value),
             kind: Some("yt-dlp".to_string()),
             source: Some("extractor".to_string()),
+            choice_group: None,
             resolutions: extract_resolutions(&value),
         });
     }
@@ -1181,6 +1794,23 @@ fn parse_probe_result(source_url: &str, value: Value) -> ProbeResult {
         title,
         entries,
     }
+}
+
+fn is_single_video_url(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+
+    if host == "youtu.be" || host.ends_with(".youtu.be") {
+        return !url.path().trim_matches('/').is_empty();
+    }
+
+    (host == "youtube.com" || host.ends_with(".youtube.com"))
+        && url.path().eq_ignore_ascii_case("/watch")
+        && url
+            .query_pairs()
+            .any(|(key, value)| key == "v" && !value.trim().is_empty())
 }
 
 fn parse_entry(source_url: &str, value: &Value) -> Option<ProbeEntry> {
@@ -1200,6 +1830,7 @@ fn parse_entry(source_url: &str, value: &Value) -> Option<ProbeEntry> {
         duration: duration_string(value),
         kind: Some("yt-dlp".to_string()),
         source: Some("extractor".to_string()),
+        choice_group: None,
         resolutions: extract_resolutions(value),
     })
 }
@@ -1322,6 +1953,9 @@ fn extract_page_candidates(base_url: &Url, html: &str) -> Vec<ProbeEntry> {
 }
 
 fn follow_target(entry: &ProbeEntry, source_url: &Url) -> Option<Url> {
+    if entry.source.as_deref() == Some("dynamic-download") {
+        return None;
+    }
     let target = entry.webpage_url.as_ref().unwrap_or(&entry.url);
     let parsed = Url::parse(target).ok()?;
 
@@ -1396,6 +2030,7 @@ fn push_candidate(
             duration: None,
             kind: Some(kind),
             source: Some(source_tag.to_string()),
+            choice_group: None,
             resolutions: Vec::new(),
         },
     ));
@@ -1788,6 +2423,10 @@ fn format_selector(max_height: Option<u32>) -> String {
     )
 }
 
+fn normalize_concurrency(value: Option<usize>) -> usize {
+    value.unwrap_or(1).clamp(1, 10)
+}
+
 fn append_ffmpeg_args(args: &mut Vec<String>) {
     if let Some(ffmpeg) = locate_ffmpeg() {
         let location = ffmpeg.parent().unwrap_or(ffmpeg.as_path());
@@ -1913,12 +2552,16 @@ fn clean_process_error(stderr: &[u8], fallback: &str) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(DownloadState::default())
+        .manage(SearchState::default())
         .invoke_handler(tauri::generate_handler![
             check_tools,
             open_youtube_login,
             save_youtube_session,
             get_youtube_session,
+            cancel_search,
             probe_url,
             scan_page,
             start_download,
@@ -1950,6 +2593,65 @@ mod tests {
         assert!(args
             .iter()
             .any(|value| value == "youtube:player_client=web_safari,android_vr"));
+    }
+
+    #[test]
+    fn youtube_watch_radio_is_treated_as_one_video() {
+        assert!(is_single_video_url(
+            "https://www.youtube.com/watch?v=YDL8HbY9ENU&list=RDYDL8HbY9ENU&start_radio=1&t=71s"
+        ));
+        assert!(!is_single_video_url(
+            "https://www.youtube.com/playlist?list=PL123"
+        ));
+    }
+
+    #[test]
+    fn dynamic_player_json_prefers_download_sources_without_duplicates() {
+        let value = serde_json::json!({
+            "embeds": [{ "lang": "Latino", "url": "https://video.example/embed/123" }],
+            "downloads": [
+                { "label": "MP4", "url": "https://cdn.example/movie.mp4" },
+                { "label": "Torrent", "url": "magnet:?xt=urn:test" }
+            ]
+        });
+        let entries = player_entries(&value, Some("https://example.com/movie"));
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.kind.as_deref() == Some("Fuente de descarga")));
+        assert!(entries.iter().any(|entry| entry.url.ends_with("movie.mp4")));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.choice_group.as_deref() == Some("https://example.com/movie")));
+    }
+
+    #[test]
+    fn mediafire_button_resolves_to_the_real_file() {
+        let page = Url::parse("https://www.mediafire.com/file/example/movie.rar/file").unwrap();
+        let html = r#"<a id="downloadButton" href="https://download.mediafire.com/movie.rar">Download</a>"#;
+
+        assert_eq!(
+            mediafire_download_url(&page, html).unwrap().as_str(),
+            "https://download.mediafire.com/movie.rar"
+        );
+        assert!(is_mediafire_page(page.as_str()));
+    }
+
+    #[test]
+    fn reliable_sources_are_sorted_first() {
+        assert!(
+            source_preference("https://www.mediafire.com/file/a")
+                < source_preference("https://mega.nz/file/a")
+        );
+    }
+
+    #[test]
+    fn download_concurrency_defaults_and_stays_bounded() {
+        assert_eq!(normalize_concurrency(None), 1);
+        assert_eq!(normalize_concurrency(Some(0)), 1);
+        assert_eq!(normalize_concurrency(Some(4)), 4);
+        assert_eq!(normalize_concurrency(Some(99)), 10);
     }
 
     #[test]

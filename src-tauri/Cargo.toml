@@ -1,6 +1,6 @@
 [package]
 name = "descargador-a1"
-version = "0.1.0"
+version = "1.0.0"
 description = "Video download queue powered by yt-dlp"
 authors = ["Jaell"]
 license = ""
@@ -17,6 +17,8 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "rustls-tls"] }
 scraper = "0.24"
 tauri = { version = "2", features = [] }
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "sync"] }
 url = "2"
 which = "8"

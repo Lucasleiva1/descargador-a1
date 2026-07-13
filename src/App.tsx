@@ -8,10 +8,13 @@ import {
   FolderInput,
   Link2,
   ListPlus,
+  LogIn,
   Loader2,
   Plus,
   RefreshCw,
+  Save,
   Search,
+  Settings2,
   Square,
   Trash2,
   X,
@@ -94,6 +97,17 @@ type BatchStateEvent = {
   message?: string;
 };
 
+type DownloadSnapshot = {
+  active: boolean;
+  updates: DownloadEvent[];
+};
+
+type YoutubeSessionState = {
+  active: boolean;
+  cookie_count: number;
+  message: string;
+};
+
 type QueueConfirmation = {
   action: "stop" | "delete";
   item: QueueItem;
@@ -123,6 +137,22 @@ function isActiveStatus(status: DownloadStatus) {
   return ["extracting", "downloading", "processing"].includes(status);
 }
 
+function mergeDownloadUpdate(item: QueueItem, payload: DownloadEvent) {
+  if (item.id !== payload.id) return item;
+
+  return {
+    ...item,
+    status: payload.status,
+    progress:
+      payload.progress ??
+      (payload.status === "completed" ? 100 : item.progress),
+    speed: payload.speed ?? item.speed,
+    eta: payload.eta ?? item.eta,
+    file: payload.file ?? item.file,
+    message: payload.message ?? item.message
+  };
+}
+
 function makeId() {
   return crypto.randomUUID();
 }
@@ -148,7 +178,10 @@ function compactUrl(url: string) {
 export function App() {
   const [sourceText, setSourceText] = useState("");
   const [referer, setReferer] = useState("");
-  const [browser, setBrowser] = useState("none");
+  const [browser, setBrowser] = useState("app");
+  const [youtubeSession, setYoutubeSession] =
+    useState<YoutubeSessionState | null>(null);
+  const [sessionBusy, setSessionBusy] = useState(false);
   const [outputDir, setOutputDir] = useState("");
   const [tools, setTools] = useState<ToolState | null>(null);
   const [found, setFound] = useState<FoundEntry[]>([]);
@@ -161,6 +194,11 @@ export function App() {
     null
   );
   const [isConfirming, setIsConfirming] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [uiScale, setUiScale] = useState(() => {
+    const stored = Number(localStorage.getItem("descargador-a1-ui-scale"));
+    return stored >= 75 && stored <= 125 ? stored : 100;
+  });
 
   const selectedFound = useMemo(
     () => found.filter((entry) => entry.selected),
@@ -178,27 +216,16 @@ export function App() {
 
   useEffect(() => {
     refreshTools();
+    refreshYoutubeSession();
 
     let unlistenJob: (() => void) | undefined;
     let unlistenBatch: (() => void) | undefined;
+    let polling = false;
 
     listen<DownloadEvent>("download://job-update", (event) => {
       const payload = event.payload;
       setQueue((current) =>
-        current.map((item) => {
-          if (item.id !== payload.id) return item;
-          return {
-            ...item,
-            status: payload.status,
-            progress:
-              payload.progress ??
-              (payload.status === "completed" ? 100 : item.progress),
-            speed: payload.speed ?? item.speed,
-            eta: payload.eta ?? item.eta,
-            file: payload.file ?? item.file,
-            message: payload.message ?? item.message
-          };
-        })
+        current.map((item) => mergeDownloadUpdate(item, payload))
       );
 
       if (payload.message) {
@@ -220,11 +247,42 @@ export function App() {
       unlistenBatch = unlisten;
     });
 
+    async function pollDownloadState() {
+      if (polling) return;
+      polling = true;
+      try {
+        const snapshot = await invoke<DownloadSnapshot>("get_download_snapshot");
+        setIsRunning(snapshot.active);
+        setQueue((current) =>
+          current.map((item) => {
+            const update = snapshot.updates.find((entry) => entry.id === item.id);
+            return update ? mergeDownloadUpdate(item, update) : item;
+          })
+        );
+      } catch {
+        // Event updates remain the primary path while the backend is restarting.
+      } finally {
+        polling = false;
+      }
+    }
+
+    void pollDownloadState();
+    const pollTimer = window.setInterval(pollDownloadState, 750);
+
     return () => {
+      window.clearInterval(pollTimer);
       unlistenJob?.();
       unlistenBatch?.();
     };
   }, []);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      "--ui-scale",
+      String(uiScale / 100)
+    );
+    localStorage.setItem("descargador-a1-ui-scale", String(uiScale));
+  }, [uiScale]);
 
   useEffect(() => {
     if (!confirmation) return;
@@ -237,6 +295,17 @@ export function App() {
     return () => document.removeEventListener("keydown", closeOnEscape);
   }, [confirmation, isConfirming]);
 
+  useEffect(() => {
+    if (!settingsOpen) return;
+
+    function closeSettings(event: KeyboardEvent) {
+      if (event.key === "Escape") setSettingsOpen(false);
+    }
+
+    document.addEventListener("keydown", closeSettings);
+    return () => document.removeEventListener("keydown", closeSettings);
+  }, [settingsOpen]);
+
   async function refreshTools() {
     try {
       const state = await invoke<ToolState>("check_tools");
@@ -246,6 +315,42 @@ export function App() {
       }
     } catch (error) {
       setNotice(String(error));
+    }
+  }
+
+  async function refreshYoutubeSession() {
+    try {
+      setYoutubeSession(
+        await invoke<YoutubeSessionState>("get_youtube_session")
+      );
+    } catch {
+      setYoutubeSession(null);
+    }
+  }
+
+  async function openYoutubeLogin() {
+    setSessionBusy(true);
+    try {
+      await invoke("open_youtube_login");
+      setNotice("Se abrio el inicio de sesion de YouTube.");
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function saveYoutubeSession() {
+    setSessionBusy(true);
+    try {
+      const state = await invoke<YoutubeSessionState>("save_youtube_session");
+      setYoutubeSession(state);
+      setBrowser("app");
+      setNotice(state.message);
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setSessionBusy(false);
     }
   }
 
@@ -531,6 +636,13 @@ export function App() {
           <ToolBadge label="Node" probe={tools?.javascript} required />
           <button
             className="icon-button"
+            onClick={() => setSettingsOpen(true)}
+            title="Configuracion"
+          >
+            <Settings2 size={17} />
+          </button>
+          <button
+            className="icon-button"
             onClick={refreshTools}
             title="Actualizar herramientas"
           >
@@ -590,19 +702,42 @@ export function App() {
             />
           </label>
 
-          <label className="field">
-            <span>Sesion del navegador</span>
-            <select
-              value={browser}
-              onChange={(event) => setBrowser(event.target.value)}
-            >
-              <option value="none">Sin sesion</option>
-              <option value="edge">Microsoft Edge</option>
-              <option value="chrome">Google Chrome</option>
-              <option value="firefox">Mozilla Firefox</option>
-              <option value="brave">Brave</option>
-            </select>
-          </label>
+          <div className="field session-field">
+            <span>Sesion de YouTube</span>
+            <div className="session-controls">
+              <select
+                value={browser}
+                onChange={(event) => setBrowser(event.target.value)}
+                aria-label="Sesion de YouTube"
+              >
+                <option value="app">Automatica</option>
+                <option value="none">Sin sesion</option>
+                <option value="edge">Microsoft Edge</option>
+                <option value="chrome">Google Chrome</option>
+                <option value="firefox">Mozilla Firefox</option>
+                <option value="brave">Brave</option>
+              </select>
+              <button
+                className="ghost-button compact-button"
+                onClick={openYoutubeLogin}
+                disabled={sessionBusy}
+              >
+                <LogIn size={17} />
+                Iniciar sesion
+              </button>
+              <button
+                className="ghost-button compact-button"
+                onClick={saveYoutubeSession}
+                disabled={sessionBusy}
+              >
+                <Save size={17} />
+                Usar sesion
+              </button>
+            </div>
+            <small className={youtubeSession?.active ? "session-ready" : "muted"}>
+              {youtubeSession?.message ?? "Sin sesion de YouTube."}
+            </small>
+          </div>
 
           <label className="field">
             <span>Carpeta</span>
@@ -798,6 +933,63 @@ export function App() {
           </div>
         </section>
       </section>
+
+      {settingsOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) setSettingsOpen(false);
+          }}
+        >
+          <section
+            className="confirm-dialog settings-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+          >
+            <button
+              className="icon-button dialog-close"
+              onClick={() => setSettingsOpen(false)}
+              title="Cerrar"
+            >
+              <X size={18} />
+            </button>
+            <div className="dialog-icon settings-icon">
+              <Settings2 size={22} />
+            </div>
+            <h2 id="settings-title">Configuracion</h2>
+
+            <label className="scale-control">
+              <span>
+                <strong>Escala de interfaz</strong>
+                <output>{uiScale}%</output>
+              </span>
+              <input
+                type="range"
+                min="75"
+                max="125"
+                step="5"
+                value={uiScale}
+                onInput={(event) =>
+                  setUiScale(Number(event.currentTarget.value))
+                }
+              />
+            </label>
+
+            <div className="dialog-actions">
+              <button className="ghost-button" onClick={() => setUiScale(100)}>
+                Restablecer
+              </button>
+              <button
+                className="primary-button"
+                onClick={() => setSettingsOpen(false)}
+              >
+                Listo
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {confirmation && (
         <div

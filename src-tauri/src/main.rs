@@ -13,7 +13,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
@@ -30,6 +30,7 @@ const FOLLOW_DELAY_MS: u64 = 450;
 struct DownloadState {
     active: Arc<AtomicBool>,
     jobs: Arc<Mutex<HashMap<String, Arc<JobCancellation>>>>,
+    updates: Arc<Mutex<HashMap<String, DownloadUpdate>>>,
 }
 
 #[derive(Default)]
@@ -110,6 +111,19 @@ struct BatchState {
     message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct DownloadSnapshot {
+    active: bool,
+    updates: Vec<DownloadUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+struct YoutubeSessionState {
+    active: bool,
+    cookie_count: usize,
+    message: String,
+}
+
 #[tauri::command]
 async fn check_tools(app: AppHandle) -> ToolState {
     let yt_dlp = probe_command(locate_yt_dlp(&app).ok(), &["--version"]).await;
@@ -121,6 +135,124 @@ async fn check_tools(app: AppHandle) -> ToolState {
         ffmpeg,
         javascript,
         default_output_dir: default_output_dir(),
+    }
+}
+
+#[tauri::command]
+async fn open_youtube_login(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("youtube-login") {
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let profile_dir = youtube_session_profile_dir(&app)?;
+    fs::create_dir_all(&profile_dir)
+        .map_err(|error| format!("No pude preparar la sesion de YouTube: {error}"))?;
+    let login_url = Url::parse(
+        "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F",
+    )
+    .map_err(|error| error.to_string())?;
+
+    WebviewWindowBuilder::new(&app, "youtube-login", WebviewUrl::External(login_url))
+        .title("Sesion de YouTube - Descargador A1")
+        .inner_size(1100.0, 760.0)
+        .min_inner_size(760.0, 560.0)
+        .data_directory(profile_dir)
+        .build()
+        .map_err(|error| format!("No pude abrir el inicio de sesion: {error}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_youtube_session(app: AppHandle) -> Result<YoutubeSessionState, String> {
+    let window = app
+        .get_webview_window("youtube-login")
+        .ok_or_else(|| "Abri primero la ventana de inicio de sesion.".to_string())?;
+
+    let cookies = tokio::task::spawn_blocking(move || window.cookies())
+        .await
+        .map_err(|error| format!("No pude leer la sesion: {error}"))?
+        .map_err(|error| format!("No pude leer la sesion: {error}"))?;
+
+    let relevant = cookies
+        .into_iter()
+        .filter(|cookie| {
+            cookie.domain().is_some_and(|domain| {
+                domain.ends_with("youtube.com") || domain.ends_with("google.com")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !relevant.iter().any(|cookie| {
+        matches!(
+            cookie.name(),
+            "SID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID"
+        )
+    }) {
+        return Err("Todavia no detecte una cuenta de YouTube iniciada.".to_string());
+    }
+
+    let cookie_file = youtube_session_cookie_file(&app)?;
+    if let Some(parent) = cookie_file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("No pude guardar la sesion: {error}"))?;
+    }
+
+    let mut contents = String::from("# Netscape HTTP Cookie File\n");
+    for cookie in &relevant {
+        let Some(domain) = cookie.domain() else {
+            continue;
+        };
+        let include_subdomains = if domain.starts_with('.') {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
+        let path = cookie.path().unwrap_or("/");
+        let secure = if cookie.secure().unwrap_or(false) {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
+        let expires = cookie
+            .expires_datetime()
+            .map(|date| date.unix_timestamp().max(0))
+            .unwrap_or(0);
+        let stored_domain = if cookie.http_only().unwrap_or(false) {
+            format!("#HttpOnly_{domain}")
+        } else {
+            domain.to_string()
+        };
+        let value = cookie.value().replace(['\t', '\r', '\n'], "");
+        contents.push_str(&format!(
+            "{stored_domain}\t{include_subdomains}\t{path}\t{secure}\t{expires}\t{}\t{value}\n",
+            cookie.name()
+        ));
+    }
+
+    fs::write(&cookie_file, contents)
+        .map_err(|error| format!("No pude guardar la sesion: {error}"))?;
+
+    Ok(YoutubeSessionState {
+        active: true,
+        cookie_count: relevant.len(),
+        message: "Sesion de YouTube lista.".to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_youtube_session(app: AppHandle) -> YoutubeSessionState {
+    let active = youtube_session_cookie_file(&app).is_ok_and(|path| path.is_file());
+    YoutubeSessionState {
+        active,
+        cookie_count: 0,
+        message: if active {
+            "Sesion de YouTube lista.".to_string()
+        } else {
+            "Sin sesion de YouTube.".to_string()
+        },
     }
 }
 
@@ -138,7 +270,6 @@ async fn probe_url(
     let yt_dlp = locate_yt_dlp(&app)?;
     let mut args = vec![
         "--dump-single-json".to_string(),
-        "--flat-playlist".to_string(),
         "--no-color".to_string(),
         "--ignore-config".to_string(),
         "--socket-timeout".to_string(),
@@ -147,6 +278,7 @@ async fn probe_url(
         "3".to_string(),
     ];
     append_runtime_args(&mut args);
+    append_managed_session_args(&app, &mut args, browser.as_deref())?;
     append_browser_args(&mut args, browser.as_deref())?;
     args.push(url.clone());
 
@@ -368,10 +500,24 @@ async fn start_download(
     }
 
     let job_controls = state.jobs.clone();
+    let updates = state.updates.clone();
     {
         let mut controls = job_controls.lock().await;
+        let mut current_updates = updates.lock().await;
         for job in &jobs {
             controls.insert(job.id.clone(), Arc::new(JobCancellation::default()));
+            current_updates.insert(
+                job.id.clone(),
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "extracting".to_string(),
+                    progress: Some(0.0),
+                    speed: None,
+                    eta: None,
+                    file: None,
+                    message: Some("Preparando descarga...".to_string()),
+                },
+            );
         }
     }
 
@@ -392,7 +538,7 @@ async fn start_download(
 
             if let Some(cancellation) = cancellation {
                 if cancellation.is_cancelled() {
-                    emit_cancelled(&app, &job.id);
+                    emit_cancelled(&app, &updates, &job.id).await;
                 } else {
                     run_download_job(
                         &app,
@@ -402,6 +548,7 @@ async fn start_download(
                         referer.as_deref(),
                         browser.as_deref(),
                         cancellation,
+                        updates.clone(),
                     )
                     .await;
                 }
@@ -424,6 +571,16 @@ async fn start_download(
 }
 
 #[tauri::command]
+async fn get_download_snapshot(
+    state: State<'_, DownloadState>,
+) -> Result<DownloadSnapshot, String> {
+    Ok(DownloadSnapshot {
+        active: state.active.load(Ordering::SeqCst),
+        updates: state.updates.lock().await.values().cloned().collect(),
+    })
+}
+
+#[tauri::command]
 async fn cancel_download(state: State<'_, DownloadState>, id: String) -> Result<bool, String> {
     let cancellation = {
         let controls = state.jobs.lock().await;
@@ -438,6 +595,7 @@ async fn cancel_download(state: State<'_, DownloadState>, id: String) -> Result<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_download_job(
     app: &AppHandle,
     yt_dlp: &PathBuf,
@@ -446,9 +604,11 @@ async fn run_download_job(
     referer: Option<&str>,
     browser: Option<&str>,
     cancellation: Arc<JobCancellation>,
+    updates: Arc<Mutex<HashMap<String, DownloadUpdate>>>,
 ) {
-    emit_update(
+    publish_update(
         app,
+        &updates,
         DownloadUpdate {
             id: job.id.clone(),
             status: "extracting".to_string(),
@@ -458,7 +618,8 @@ async fn run_download_job(
             file: None,
             message: job.title.clone().or_else(|| Some(job.url.clone())),
         },
-    );
+    )
+    .await;
 
     let mut args = vec![
         "--newline".to_string(),
@@ -493,9 +654,10 @@ async fn run_download_job(
 
     append_runtime_args(&mut args);
     append_ffmpeg_args(&mut args);
-    if let Err(error) = append_browser_args(&mut args, browser) {
-        emit_update(
+    if let Err(error) = append_managed_session_args(app, &mut args, browser) {
+        publish_update(
             app,
+            &updates,
             DownloadUpdate {
                 id: job.id.clone(),
                 status: "failed".to_string(),
@@ -505,7 +667,25 @@ async fn run_download_job(
                 file: None,
                 message: Some(error),
             },
-        );
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = append_browser_args(&mut args, browser) {
+        publish_update(
+            app,
+            &updates,
+            DownloadUpdate {
+                id: job.id.clone(),
+                status: "failed".to_string(),
+                progress: None,
+                speed: None,
+                eta: None,
+                file: None,
+                message: Some(error),
+            },
+        )
+        .await;
         return;
     }
 
@@ -531,8 +711,9 @@ async fn run_download_job(
     {
         Ok(child) => child,
         Err(error) => {
-            emit_update(
+            publish_update(
                 app,
+                &updates,
                 DownloadUpdate {
                     id: job.id.clone(),
                     status: "failed".to_string(),
@@ -542,7 +723,8 @@ async fn run_download_job(
                     file: None,
                     message: Some(format!("No pude iniciar yt-dlp: {error}")),
                 },
-            );
+            )
+            .await;
             return;
         }
     };
@@ -553,15 +735,19 @@ async fn run_download_job(
     let stderr_app = app.clone();
     let stdout_job = job.id.clone();
     let stderr_job = job.id.clone();
+    let stdout_updates = updates.clone();
+    let stderr_updates = updates.clone();
 
     let stdout_task = stdout.map(|stream| {
         tokio::spawn(async move {
-            read_process_stream(stdout_app, stdout_job, stream).await;
+            read_process_stream(stdout_app, stdout_job, stream, stdout_updates).await;
         })
     });
 
     let stderr_task = stderr.map(|stream| {
-        tokio::spawn(async move { read_process_stream(stderr_app, stderr_job, stream).await })
+        tokio::spawn(async move {
+            read_process_stream(stderr_app, stderr_job, stream, stderr_updates).await
+        })
     });
 
     let result = if cancellation.is_cancelled() {
@@ -587,45 +773,72 @@ async fn run_download_job(
     };
 
     match result {
-        None => emit_cancelled(app, &job.id),
-        Some(Ok(status)) if status.success() => emit_update(
-            app,
-            DownloadUpdate {
-                id: job.id.clone(),
-                status: "completed".to_string(),
-                progress: Some(100.0),
-                speed: None,
-                eta: None,
-                file: None,
-                message: Some("Descarga completa.".to_string()),
-            },
-        ),
-        Some(Ok(status)) => emit_update(
-            app,
-            DownloadUpdate {
-                id: job.id.clone(),
-                status: "failed".to_string(),
-                progress: None,
-                speed: None,
-                eta: None,
-                file: None,
-                message: Some(
-                    stderr_message.unwrap_or_else(|| format!("yt-dlp terminó con código {status}")),
-                ),
-            },
-        ),
-        Some(Err(error)) => emit_update(
-            app,
-            DownloadUpdate {
-                id: job.id.clone(),
-                status: "failed".to_string(),
-                progress: None,
-                speed: None,
-                eta: None,
-                file: None,
-                message: Some(format!("Error esperando a yt-dlp: {error}")),
-            },
-        ),
+        None => emit_cancelled(app, &updates, &job.id).await,
+        Some(Ok(status)) if status.success() => {
+            let final_file = updates
+                .lock()
+                .await
+                .get(&job.id)
+                .and_then(|update| update.file.clone());
+            let empty_file = final_file
+                .as_ref()
+                .and_then(|path| fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.len() == 0);
+
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: if empty_file { "failed" } else { "completed" }.to_string(),
+                    progress: if empty_file { None } else { Some(100.0) },
+                    speed: None,
+                    eta: None,
+                    file: final_file,
+                    message: Some(if empty_file {
+                        "El archivo resultante esta vacio; volve a iniciar la descarga.".to_string()
+                    } else {
+                        "Descarga completa.".to_string()
+                    }),
+                },
+            )
+            .await;
+        }
+        Some(Ok(status)) => {
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "failed".to_string(),
+                    progress: None,
+                    speed: None,
+                    eta: None,
+                    file: None,
+                    message: Some(
+                        stderr_message
+                            .unwrap_or_else(|| format!("yt-dlp terminó con código {status}")),
+                    ),
+                },
+            )
+            .await;
+        }
+        Some(Err(error)) => {
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "failed".to_string(),
+                    progress: None,
+                    speed: None,
+                    eta: None,
+                    file: None,
+                    message: Some(format!("Error esperando a yt-dlp: {error}")),
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -644,9 +857,14 @@ async fn terminate_child(child: &mut Child) {
     let _ = child.wait().await;
 }
 
-fn emit_cancelled(app: &AppHandle, id: &str) {
-    emit_update(
+async fn emit_cancelled(
+    app: &AppHandle,
+    updates: &Arc<Mutex<HashMap<String, DownloadUpdate>>>,
+    id: &str,
+) {
+    publish_update(
         app,
+        updates,
         DownloadUpdate {
             id: id.to_string(),
             status: "cancelled".to_string(),
@@ -656,10 +874,16 @@ fn emit_cancelled(app: &AppHandle, id: &str) {
             file: None,
             message: Some("Descarga detenida.".to_string()),
         },
-    );
+    )
+    .await;
 }
 
-async fn read_process_stream<R>(app: AppHandle, job_id: String, stream: R) -> Option<String>
+async fn read_process_stream<R>(
+    app: AppHandle,
+    job_id: String,
+    stream: R,
+    updates: Arc<Mutex<HashMap<String, DownloadUpdate>>>,
+) -> Option<String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -677,7 +901,7 @@ where
         }
 
         if let Some(update) = parse_download_line(&job_id, line) {
-            emit_update(&app, update);
+            publish_update(&app, &updates, update).await;
         }
     }
 
@@ -864,7 +1088,15 @@ fn parse_speed_eta(line: &str) -> (Option<String>, Option<String>) {
     )
 }
 
-fn emit_update(app: &AppHandle, update: DownloadUpdate) {
+async fn publish_update(
+    app: &AppHandle,
+    updates: &Arc<Mutex<HashMap<String, DownloadUpdate>>>,
+    update: DownloadUpdate,
+) {
+    updates
+        .lock()
+        .await
+        .insert(update.id.clone(), update.clone());
     let _ = app.emit("download://job-update", update);
 }
 
@@ -1510,6 +1742,39 @@ fn append_runtime_args(args: &mut Vec<String>) {
         args.push("--js-runtimes".to_string());
         args.push(format!("node:{}", node.to_string_lossy()));
     }
+    args.push("--extractor-args".to_string());
+    args.push("youtube:player_client=web_safari,android_vr".to_string());
+}
+
+fn youtube_session_profile_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|path| path.join("youtube-session"))
+        .map_err(|error| format!("No pude ubicar los datos de la aplicacion: {error}"))
+}
+
+fn youtube_session_cookie_file(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|path| path.join("youtube-cookies.txt"))
+        .map_err(|error| format!("No pude ubicar los datos de la aplicacion: {error}"))
+}
+
+fn append_managed_session_args(
+    app: &AppHandle,
+    args: &mut Vec<String>,
+    browser: Option<&str>,
+) -> Result<(), String> {
+    if !browser.is_some_and(|value| matches!(value.trim(), "app" | "auto")) {
+        return Ok(());
+    }
+
+    let cookie_file = youtube_session_cookie_file(app)?;
+    if cookie_file.is_file() {
+        args.push("--cookies".to_string());
+        args.push(cookie_file.to_string_lossy().to_string());
+    }
+    Ok(())
 }
 
 fn format_selector(max_height: Option<u32>) -> String {
@@ -1536,7 +1801,10 @@ fn append_browser_args(args: &mut Vec<String>, browser: Option<&str>) -> Result<
         return Ok(());
     };
 
-    if browser.eq_ignore_ascii_case("none") {
+    if matches!(
+        browser.to_ascii_lowercase().as_str(),
+        "none" | "app" | "auto"
+    ) {
         return Ok(());
     }
 
@@ -1648,10 +1916,14 @@ fn main() {
         .manage(DownloadState::default())
         .invoke_handler(tauri::generate_handler![
             check_tools,
+            open_youtube_login,
+            save_youtube_session,
+            get_youtube_session,
             probe_url,
             scan_page,
             start_download,
-            cancel_download
+            cancel_download,
+            get_download_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1666,7 +1938,18 @@ mod tests {
         let mut args = Vec::new();
         append_browser_args(&mut args, Some("edge")).unwrap();
         assert_eq!(args, ["--cookies-from-browser", "edge"]);
+        append_browser_args(&mut args, Some("app")).unwrap();
         assert!(append_browser_args(&mut args, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn youtube_clients_avoid_the_drm_only_default() {
+        let mut args = Vec::new();
+        append_runtime_args(&mut args);
+
+        assert!(args
+            .iter()
+            .any(|value| value == "youtube:player_client=web_safari,android_vr"));
     }
 
     #[test]

@@ -40,6 +40,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -210,7 +211,8 @@ h1 {
 }
 
 textarea,
-input {
+input,
+select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -239,8 +241,14 @@ input {
   padding: 0 11px;
 }
 
+select {
+  min-height: 40px;
+  padding: 0 11px;
+}
+
 textarea:focus,
-input:focus {
+input:focus,
+select:focus {
   border-color: rgba(33, 199, 183, 0.7);
   box-shadow: 0 0 0 3px rgba(33, 199, 183, 0.16);
 }
@@ -376,13 +384,17 @@ button:disabled {
 
 .found-row {
   display: grid;
-  grid-template-columns: 18px 1fr;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
   gap: 9px;
-  align-items: start;
+  align-items: center;
   padding: 9px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface-strong);
+}
+
+.found-details {
+  min-width: 0;
 }
 
 .found-row input {
@@ -403,6 +415,20 @@ button:disabled {
 
 .found-row strong {
   font-size: 13px;
+}
+
+.resolution-select {
+  width: auto;
+  min-width: 142px;
+  min-height: 34px;
+  color: var(--ink);
+  background: var(--field);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.queue-resolution {
+  min-width: 96px;
 }
 
 .found-row small {
@@ -771,5 +797,14 @@ button:disabled {
 
   .status-pill {
     width: fit-content;
+  }
+
+  .found-row {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .found-row .resolution-select {
+    grid-column: 2;
+    justify-self: start;
   }
 }

@@ -39,6 +39,7 @@ type ToolProbe = {
 type ToolState = {
   yt_dlp: ToolProbe;
   ffmpeg: ToolProbe;
+  javascript: ToolProbe;
   default_output_dir?: string;
 };
 
@@ -50,6 +51,7 @@ type ProbeEntry = {
   duration?: string;
   kind?: string;
   source?: string;
+  resolutions: number[];
 };
 
 type ProbeResult = {
@@ -68,10 +70,13 @@ type QueueItem = {
   eta?: string;
   file?: string;
   message?: string;
+  resolutions: number[];
+  resolution: number | null;
 };
 
 type FoundEntry = ProbeEntry & {
   selected: boolean;
+  resolution: number | null;
 };
 
 type DownloadEvent = {
@@ -143,6 +148,7 @@ function compactUrl(url: string) {
 export function App() {
   const [sourceText, setSourceText] = useState("");
   const [referer, setReferer] = useState("");
+  const [browser, setBrowser] = useState("none");
   const [outputDir, setOutputDir] = useState("");
   const [tools, setTools] = useState<ToolState | null>(null);
   const [found, setFound] = useState<FoundEntry[]>([]);
@@ -257,19 +263,35 @@ export function App() {
       let mode = "yt-dlp";
 
       try {
-        result = await invoke<ProbeResult>("probe_url", { url });
-      } catch {
-        mode = "escaneo";
-        result = await invoke<ProbeResult>("scan_page", {
+        result = await invoke<ProbeResult>("probe_url", {
           url,
-          referer: referer.trim() || null
+          browser: browser === "none" ? null : browser
         });
+      } catch (extractorError) {
+        mode = "escaneo";
+        try {
+          result = await invoke<ProbeResult>("scan_page", {
+            url,
+            referer: referer.trim() || null
+          });
+        } catch (scanError) {
+          throw new Error(
+            `yt-dlp: ${String(extractorError)} | Escaneo: ${String(scanError)}`
+          );
+        }
         if (!referer.trim()) {
           setReferer(url);
         }
       }
 
-      setFound(result.entries.map((entry) => ({ ...entry, selected: true })));
+      setFound(
+        result.entries.map((entry) => ({
+          ...entry,
+          resolutions: entry.resolutions ?? [],
+          selected: true,
+          resolution: null
+        }))
+      );
       setNotice(
         result.entries.length === 1
           ? `Se encontro 1 entrada con ${mode}.`
@@ -318,11 +340,20 @@ export function App() {
   function foundEntriesToQueueInput(entries: FoundEntry[]) {
     return entries.map((entry) => ({
       url: entry.webpage_url || entry.url,
-      title: entryTitle(entry)
+      title: entryTitle(entry),
+      resolutions: entry.resolutions,
+      resolution: entry.resolution
     }));
   }
 
-  function addToQueue(items: Array<{ url: string; title: string }>) {
+  function addToQueue(
+    items: Array<{
+      url: string;
+      title: string;
+      resolutions?: number[];
+      resolution?: number | null;
+    }>
+  ) {
     const normalized = items.filter((item) => item.url.trim());
     if (!normalized.length) return [];
 
@@ -334,7 +365,9 @@ export function App() {
         title: item.title,
         url: item.url,
         status: "pending",
-        progress: 0
+        progress: 0,
+        resolutions: item.resolutions ?? [],
+        resolution: item.resolution ?? null
       }));
 
     if (!fresh.length) {
@@ -369,7 +402,8 @@ export function App() {
     const jobs = items.map((item) => ({
       id: item.id,
       title: item.title,
-      url: item.url
+      url: item.url,
+      maxHeight: item.resolution
     }));
     const jobIds = new Set(jobs.map((job) => job.id));
 
@@ -392,7 +426,8 @@ export function App() {
       await invoke("start_download", {
         jobs,
         outputDir: outputDir.trim() || null,
-        referer: referer.trim() || null
+        referer: referer.trim() || null,
+        browser: browser === "none" ? null : browser
       });
       setIsRunning(true);
     } catch (error) {
@@ -471,7 +506,11 @@ export function App() {
     }
   }
 
-  const ytReady = tools?.yt_dlp.available ?? false;
+  const ytReady = Boolean(
+    tools?.yt_dlp.available &&
+      tools?.ffmpeg.available &&
+      tools?.javascript.available
+  );
 
   return (
     <main className="app-shell">
@@ -488,7 +527,8 @@ export function App() {
 
         <div className="tool-strip">
           <ToolBadge label="yt-dlp" probe={tools?.yt_dlp} required />
-          <ToolBadge label="ffmpeg" probe={tools?.ffmpeg} />
+          <ToolBadge label="ffmpeg" probe={tools?.ffmpeg} required />
+          <ToolBadge label="Node" probe={tools?.javascript} required />
           <button
             className="icon-button"
             onClick={refreshTools}
@@ -551,6 +591,20 @@ export function App() {
           </label>
 
           <label className="field">
+            <span>Sesion del navegador</span>
+            <select
+              value={browser}
+              onChange={(event) => setBrowser(event.target.value)}
+            >
+              <option value="none">Sin sesion</option>
+              <option value="edge">Microsoft Edge</option>
+              <option value="chrome">Google Chrome</option>
+              <option value="firefox">Mozilla Firefox</option>
+              <option value="brave">Brave</option>
+            </select>
+          </label>
+
+          <label className="field">
             <span>Carpeta</span>
             <div className="input-icon">
               <FolderInput size={17} />
@@ -594,9 +648,10 @@ export function App() {
 
             <div className="found-list">
               {found.map((entry, index) => (
-                <label className="found-row" key={`${entry.url}-${index}`}>
+                <div className="found-row" key={`${entry.url}-${index}`}>
                   <input
                     type="checkbox"
+                    aria-label={`Seleccionar ${entryTitle(entry)}`}
                     checked={entry.selected}
                     onChange={(event) => {
                       const checked = event.target.checked;
@@ -609,14 +664,42 @@ export function App() {
                       );
                     }}
                   />
-                  <span>
+                  <span className="found-details">
                     <strong>{entryTitle(entry)}</strong>
                     <small className="link-line">
                       <span className="link-kind">{entry.kind || "link"}</span>
                       {compactUrl(entry.webpage_url || entry.url)}
                     </small>
                   </span>
-                </label>
+                  {entry.resolutions.length > 0 && (
+                    <select
+                      className="resolution-select"
+                      value={entry.resolution ?? "best"}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setFound((current) =>
+                          current.map((item, itemIndex) =>
+                            itemIndex === index
+                              ? {
+                                  ...item,
+                                  resolution:
+                                    value === "best" ? null : Number(value)
+                                }
+                              : item
+                          )
+                        );
+                      }}
+                      title="Resolucion de descarga"
+                    >
+                      <option value="best">Mejor disponible</option>
+                      {entry.resolutions.map((height) => (
+                        <option value={height} key={height}>
+                          {height}p
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
               ))}
             </div>
           </section>
@@ -686,6 +769,13 @@ export function App() {
                   onDownload={() => startJobs([item])}
                   onStop={() => setConfirmation({ action: "stop", item })}
                   onDelete={() => setConfirmation({ action: "delete", item })}
+                  onResolutionChange={(resolution) =>
+                    setQueue((current) =>
+                      current.map((entry) =>
+                        entry.id === item.id ? { ...entry, resolution } : entry
+                      )
+                    )
+                  }
                   key={item.id}
                 />
               ))
@@ -817,13 +907,15 @@ function QueueRow({
   canDownload,
   onDownload,
   onStop,
-  onDelete
+  onDelete,
+  onResolutionChange
 }: {
   item: QueueItem;
   canDownload: boolean;
   onDownload: () => void;
   onStop: () => void;
   onDelete: () => void;
+  onResolutionChange: (resolution: number | null) => void;
 }) {
   const isPending =
     item.status === "pending" ||
@@ -843,6 +935,28 @@ function QueueRow({
         </div>
 
         <div className="queue-actions">
+          {item.resolutions.length > 0 && (
+            <select
+              className="resolution-select queue-resolution"
+              value={item.resolution ?? "best"}
+              onChange={(event) =>
+                onResolutionChange(
+                  event.target.value === "best"
+                    ? null
+                    : Number(event.target.value)
+                )
+              }
+              disabled={!isPending}
+              title="Resolucion de descarga"
+            >
+              <option value="best">Mejor</option>
+              {item.resolutions.map((height) => (
+                <option value={height} key={height}>
+                  {height}p
+                </option>
+              ))}
+            </select>
+          )}
           {isPending && (
             <button
               className="primary-button compact-button row-download"

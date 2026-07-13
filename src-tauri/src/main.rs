@@ -3,7 +3,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
     process::Stdio,
@@ -23,7 +23,7 @@ use url::Url;
 
 const SCANNER_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DescargadorA1/0.1 authorized-link-scanner";
-const MAX_FOLLOW_LINKS: usize = 6;
+const MAX_FOLLOW_LINKS: usize = 12;
 const FOLLOW_DELAY_MS: u64 = 450;
 
 #[derive(Default)]
@@ -61,6 +61,7 @@ struct ToolProbe {
 struct ToolState {
     yt_dlp: ToolProbe,
     ffmpeg: ToolProbe,
+    javascript: ToolProbe,
     default_output_dir: Option<String>,
 }
 
@@ -73,6 +74,7 @@ struct ProbeEntry {
     duration: Option<String>,
     kind: Option<String>,
     source: Option<String>,
+    resolutions: Vec<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +89,8 @@ struct DownloadJob {
     id: String,
     title: Option<String>,
     url: String,
+    #[serde(rename = "maxHeight")]
+    max_height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -109,32 +113,45 @@ struct BatchState {
 #[tauri::command]
 async fn check_tools(app: AppHandle) -> ToolState {
     let yt_dlp = probe_command(locate_yt_dlp(&app).ok(), &["--version"]).await;
-    let ffmpeg = probe_command(locate_path_command("ffmpeg"), &["-version"]).await;
+    let ffmpeg = probe_command(locate_ffmpeg(), &["-version"]).await;
+    let javascript = probe_command(locate_node(), &["--version"]).await;
 
     ToolState {
         yt_dlp,
         ffmpeg,
+        javascript,
         default_output_dir: default_output_dir(),
     }
 }
 
 #[tauri::command]
-async fn probe_url(app: AppHandle, url: String) -> Result<ProbeResult, String> {
+async fn probe_url(
+    app: AppHandle,
+    url: String,
+    browser: Option<String>,
+) -> Result<ProbeResult, String> {
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("Pegá una URL válida.".to_string());
     }
 
     let yt_dlp = locate_yt_dlp(&app)?;
+    let mut args = vec![
+        "--dump-single-json".to_string(),
+        "--flat-playlist".to_string(),
+        "--no-color".to_string(),
+        "--ignore-config".to_string(),
+        "--socket-timeout".to_string(),
+        "30".to_string(),
+        "--retries".to_string(),
+        "3".to_string(),
+    ];
+    append_runtime_args(&mut args);
+    append_browser_args(&mut args, browser.as_deref())?;
+    args.push(url.clone());
+
     let output = Command::new(&yt_dlp)
-        .args([
-            "--dump-single-json",
-            "--flat-playlist",
-            "--no-warnings",
-            "--no-color",
-            "--ignore-config",
-        ])
-        .arg(&url)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -185,6 +202,14 @@ async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, 
         .map(|entry| entry.url.clone())
         .collect::<HashSet<_>>();
 
+    if let Some(rendered_html) = render_page(&final_url).await {
+        for entry in extract_page_candidates(&final_url, &rendered_html) {
+            if seen.insert(entry.url.clone()) {
+                entries.push(entry);
+            }
+        }
+    }
+
     let follow_targets = entries
         .iter()
         .filter_map(|entry| follow_target(entry, &final_url))
@@ -218,6 +243,44 @@ async fn scan_page(url: String, referer: Option<String>) -> Result<ProbeResult, 
         title,
         entries,
     })
+}
+
+async fn render_page(url: &Url) -> Option<String> {
+    let edge = locate_edge()?;
+    let profile = std::env::temp_dir().join(format!(
+        "descargador-a1-edge-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+    ));
+
+    let mut command = Command::new(edge);
+    command
+        .args([
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--dump-dom",
+            "--virtual-time-budget=12000",
+        ])
+        .arg(format!("--user-data-dir={}", profile.to_string_lossy()))
+        .arg(url.as_str())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(Duration::from_secs(35), command.output()).await;
+    let _ = fs::remove_dir_all(profile);
+    let output = output.ok()?.ok()?;
+
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .filter(|html| !html.trim().is_empty())
 }
 
 async fn fetch_html(
@@ -279,6 +342,7 @@ async fn start_download(
     jobs: Vec<DownloadJob>,
     output_dir: Option<String>,
     referer: Option<String>,
+    browser: Option<String>,
 ) -> Result<(), String> {
     if jobs.is_empty() {
         return Err("La cola está vacía.".to_string());
@@ -336,6 +400,7 @@ async fn start_download(
                         &job,
                         output_dir.as_ref(),
                         referer.as_deref(),
+                        browser.as_deref(),
                         cancellation,
                     )
                     .await;
@@ -379,6 +444,7 @@ async fn run_download_job(
     job: &DownloadJob,
     output_dir: Option<&PathBuf>,
     referer: Option<&str>,
+    browser: Option<&str>,
     cancellation: Arc<JobCancellation>,
 ) {
     emit_update(
@@ -400,12 +466,48 @@ async fn run_download_job(
         "--ignore-config".to_string(),
         "--windows-filenames".to_string(),
         "--no-playlist".to_string(),
+        "--continue".to_string(),
+        "--part".to_string(),
+        "--retries".to_string(),
+        "10".to_string(),
+        "--fragment-retries".to_string(),
+        "10".to_string(),
+        "--file-access-retries".to_string(),
+        "10".to_string(),
+        "--retry-sleep".to_string(),
+        "fragment:exp=1:20".to_string(),
+        "--socket-timeout".to_string(),
+        "30".to_string(),
+        "--concurrent-fragments".to_string(),
+        "4".to_string(),
+        "--format".to_string(),
+        format_selector(job.max_height),
         "--merge-output-format".to_string(),
         "mp4".to_string(),
         "--no-overwrites".to_string(),
+        "--print".to_string(),
+        "after_move:[download] Final file: %(filepath)s".to_string(),
         "-o".to_string(),
         "%(title).200B [%(id)s].%(ext)s".to_string(),
     ];
+
+    append_runtime_args(&mut args);
+    append_ffmpeg_args(&mut args);
+    if let Err(error) = append_browser_args(&mut args, browser) {
+        emit_update(
+            app,
+            DownloadUpdate {
+                id: job.id.clone(),
+                status: "failed".to_string(),
+                progress: None,
+                speed: None,
+                eta: None,
+                file: None,
+                message: Some(error),
+            },
+        );
+        return;
+    }
 
     if let Some(path) = output_dir {
         args.push("-P".to_string());
@@ -459,9 +561,7 @@ async fn run_download_job(
     });
 
     let stderr_task = stderr.map(|stream| {
-        tokio::spawn(async move {
-            read_process_stream(stderr_app, stderr_job, stream).await;
-        })
+        tokio::spawn(async move { read_process_stream(stderr_app, stderr_job, stream).await })
     });
 
     let result = if cancellation.is_cancelled() {
@@ -480,9 +580,11 @@ async fn run_download_job(
     if let Some(task) = stdout_task {
         let _ = task.await;
     }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
+    let stderr_message = if let Some(task) = stderr_task {
+        task.await.ok().flatten()
+    } else {
+        None
+    };
 
     match result {
         None => emit_cancelled(app, &job.id),
@@ -507,7 +609,9 @@ async fn run_download_job(
                 speed: None,
                 eta: None,
                 file: None,
-                message: Some(format!("yt-dlp terminó con código {status}")),
+                message: Some(
+                    stderr_message.unwrap_or_else(|| format!("yt-dlp terminó con código {status}")),
+                ),
             },
         ),
         Some(Err(error)) => emit_update(
@@ -555,21 +659,46 @@ fn emit_cancelled(app: &AppHandle, id: &str) {
     );
 }
 
-async fn read_process_stream<R>(app: AppHandle, job_id: String, stream: R)
+async fn read_process_stream<R>(app: AppHandle, job_id: String, stream: R) -> Option<String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(stream).lines();
+    let mut last_error = None;
+    let mut last_warning = None;
+
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(update) = parse_download_line(&job_id, line.trim()) {
+        let line = line.trim();
+        let lowercase = line.to_ascii_lowercase();
+        if line.starts_with("ERROR:") || lowercase.contains("error:") {
+            last_error = Some(line.to_string());
+        } else if line.starts_with("WARNING:") {
+            last_warning = Some(line.to_string());
+        }
+
+        if let Some(update) = parse_download_line(&job_id, line) {
             emit_update(&app, update);
         }
     }
+
+    last_error.or(last_warning)
 }
 
 fn parse_download_line(job_id: &str, line: &str) -> Option<DownloadUpdate> {
     if line.is_empty() {
         return None;
+    }
+
+    if let Some(file) = line.strip_prefix("[download] Final file: ") {
+        return Some(DownloadUpdate {
+            id: job_id.to_string(),
+            status: "completed".to_string(),
+            progress: Some(100.0),
+            speed: None,
+            eta: None,
+            file: Some(file.trim().to_string()),
+            message: Some("Archivo listo.".to_string()),
+        });
     }
 
     if let Some(file) = line.strip_prefix("[download] Destination: ") {
@@ -616,6 +745,18 @@ fn parse_download_line(job_id: &str, line: &str) -> Option<DownloadUpdate> {
         return Some(DownloadUpdate {
             id: job_id.to_string(),
             status: "processing".to_string(),
+            progress: None,
+            speed: None,
+            eta: None,
+            file: None,
+            message: Some(line.to_string()),
+        });
+    }
+
+    if line.starts_with("WARNING:") {
+        return Some(DownloadUpdate {
+            id: job_id.to_string(),
+            status: "extracting".to_string(),
             progress: None,
             speed: None,
             eta: None,
@@ -799,6 +940,7 @@ fn parse_probe_result(source_url: &str, value: Value) -> ProbeResult {
             duration: duration_string(&value),
             kind: Some("yt-dlp".to_string()),
             source: Some("extractor".to_string()),
+            resolutions: extract_resolutions(&value),
         });
     }
 
@@ -826,7 +968,30 @@ fn parse_entry(source_url: &str, value: &Value) -> Option<ProbeEntry> {
         duration: duration_string(value),
         kind: Some("yt-dlp".to_string()),
         source: Some("extractor".to_string()),
+        resolutions: extract_resolutions(value),
     })
+}
+
+fn extract_resolutions(value: &Value) -> Vec<u32> {
+    let mut heights = value
+        .get("formats")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|format| {
+            format
+                .get("vcodec")
+                .and_then(Value::as_str)
+                .is_some_and(|codec| codec != "none")
+        })
+        .filter_map(|format| format.get("height").and_then(Value::as_u64))
+        .filter_map(|height| u32::try_from(height).ok())
+        .filter(|height| *height > 0)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    heights.reverse();
+    heights
 }
 
 fn extract_page_title(html: &str) -> Option<String> {
@@ -999,6 +1164,7 @@ fn push_candidate(
             duration: None,
             kind: Some(kind),
             source: Some(source_tag.to_string()),
+            resolutions: Vec::new(),
         },
     ));
 }
@@ -1339,6 +1505,103 @@ fn locate_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
     })
 }
 
+fn append_runtime_args(args: &mut Vec<String>) {
+    if let Some(node) = locate_node() {
+        args.push("--js-runtimes".to_string());
+        args.push(format!("node:{}", node.to_string_lossy()));
+    }
+}
+
+fn format_selector(max_height: Option<u32>) -> String {
+    let Some(height) = max_height.filter(|height| *height > 0) else {
+        return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b".to_string();
+    };
+    let height = height.min(16_384);
+
+    format!(
+        "bv*[height<={height}][ext=mp4]+ba[ext=m4a]/b[height<={height}][ext=mp4]/bv*[height<={height}]+ba/b[height<={height}]"
+    )
+}
+
+fn append_ffmpeg_args(args: &mut Vec<String>) {
+    if let Some(ffmpeg) = locate_ffmpeg() {
+        let location = ffmpeg.parent().unwrap_or(ffmpeg.as_path());
+        args.push("--ffmpeg-location".to_string());
+        args.push(location.to_string_lossy().to_string());
+    }
+}
+
+fn append_browser_args(args: &mut Vec<String>, browser: Option<&str>) -> Result<(), String> {
+    let Some(browser) = browser.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    if browser.eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+
+    let normalized = browser.to_ascii_lowercase();
+    if !matches!(normalized.as_str(), "brave" | "chrome" | "edge" | "firefox") {
+        return Err("Navegador de cookies no compatible.".to_string());
+    }
+
+    args.push("--cookies-from-browser".to_string());
+    args.push(normalized);
+    Ok(())
+}
+
+fn locate_node() -> Option<PathBuf> {
+    locate_path_command("node").or_else(|| {
+        let program_files = std::env::var_os("ProgramFiles")?;
+        let candidate = PathBuf::from(program_files).join("nodejs").join("node.exe");
+        candidate.exists().then_some(candidate)
+    })
+}
+
+fn locate_ffmpeg() -> Option<PathBuf> {
+    locate_path_command("ffmpeg").or_else(|| locate_winget_binary("Gyan.FFmpeg", "ffmpeg.exe"))
+}
+
+fn locate_winget_binary(package_prefix: &str, executable: &str) -> Option<PathBuf> {
+    let packages = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join("Microsoft")
+        .join("WinGet")
+        .join("Packages");
+
+    for package in fs::read_dir(packages).ok()?.flatten() {
+        if !package
+            .file_name()
+            .to_string_lossy()
+            .starts_with(package_prefix)
+        {
+            continue;
+        }
+
+        for distribution in fs::read_dir(package.path()).ok()?.flatten() {
+            let candidate = distribution.path().join("bin").join(executable);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn locate_edge() -> Option<PathBuf> {
+    ["ProgramFiles(x86)", "ProgramFiles"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("Microsoft")
+                .join("Edge")
+                .join("Application")
+                .join("msedge.exe")
+        })
+        .find(|candidate| candidate.exists())
+}
+
 fn locate_path_command(name: &str) -> Option<PathBuf> {
     which::which(name).ok()
 }
@@ -1392,4 +1655,54 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_arguments_are_allowlisted() {
+        let mut args = Vec::new();
+        append_browser_args(&mut args, Some("edge")).unwrap();
+        assert_eq!(args, ["--cookies-from-browser", "edge"]);
+        assert!(append_browser_args(&mut args, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn final_file_line_completes_the_job() {
+        let update =
+            parse_download_line("job-1", "[download] Final file: C:\\Downloads\\video.mp4")
+                .unwrap();
+
+        assert_eq!(update.status, "completed");
+        assert_eq!(update.progress, Some(100.0));
+        assert_eq!(update.file.as_deref(), Some("C:\\Downloads\\video.mp4"));
+    }
+
+    #[test]
+    fn scanner_finds_media_urls_inside_scripts() {
+        let base = Url::parse("https://example.com/watch").unwrap();
+        let html = r#"<script>const source = "https://cdn.example.com/video.mp4";</script>"#;
+        let entries = extract_page_candidates(&base, html);
+
+        assert!(entries
+            .iter()
+            .any(|entry| entry.url == "https://cdn.example.com/video.mp4"));
+    }
+
+    #[test]
+    fn resolutions_are_unique_and_sorted_highest_first() {
+        let value = serde_json::json!({
+            "formats": [
+                { "height": 720, "vcodec": "avc1" },
+                { "height": 1080, "vcodec": "av01" },
+                { "height": 720, "vcodec": "vp9" },
+                { "vcodec": "none" }
+            ]
+        });
+
+        assert_eq!(extract_resolutions(&value), [1080, 720]);
+        assert!(format_selector(Some(720)).contains("height<=720"));
+    }
 }

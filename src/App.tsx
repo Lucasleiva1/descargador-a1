@@ -806,34 +806,48 @@ export function App() {
                       {compactUrl(entry.webpage_url || entry.url)}
                     </small>
                   </span>
-                  {entry.resolutions.length > 0 && (
-                    <select
-                      className="resolution-select"
-                      value={entry.resolution ?? "best"}
-                      onChange={(event) => {
-                        const value = event.target.value;
+                  <div className="found-actions">
+                    {entry.resolutions.length > 0 && (
+                      <select
+                        className="resolution-select"
+                        value={entry.resolution ?? "best"}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setFound((current) =>
+                            current.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? {
+                                    ...item,
+                                    resolution:
+                                      value === "best" ? null : Number(value)
+                                  }
+                                : item
+                            )
+                          );
+                        }}
+                        title="Resolucion de descarga"
+                      >
+                        <option value="best">Mejor disponible</option>
+                        {entry.resolutions.map((height) => (
+                          <option value={height} key={height}>
+                            {height}p
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <button
+                      className="icon-button danger compact-icon-button"
+                      onClick={() =>
                         setFound((current) =>
-                          current.map((item, itemIndex) =>
-                            itemIndex === index
-                              ? {
-                                  ...item,
-                                  resolution:
-                                    value === "best" ? null : Number(value)
-                                }
-                              : item
-                          )
-                        );
-                      }}
-                      title="Resolucion de descarga"
+                          current.filter((_, itemIndex) => itemIndex !== index)
+                        )
+                      }
+                      title="Eliminar detectado"
+                      aria-label={`Eliminar ${entryTitle(entry)}`}
                     >
-                      <option value="best">Mejor disponible</option>
-                      {entry.resolutions.map((height) => (
-                        <option value={height} key={height}>
-                          {height}p
-                        </option>
-                      ))}
-                    </select>
-                  )}
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>

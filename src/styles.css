@@ -449,6 +449,14 @@ button:disabled {
   font-weight: 700;
 }
 
+.found-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
 .queue-resolution {
   min-width: 96px;
 }
@@ -884,7 +892,7 @@ button:disabled {
     grid-template-columns: 18px minmax(0, 1fr);
   }
 
-  .found-row .resolution-select {
+  .found-row .found-actions {
     grid-column: 2;
     justify-self: start;
   }

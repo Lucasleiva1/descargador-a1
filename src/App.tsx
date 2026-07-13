@@ -81,6 +81,7 @@ type QueueItem = {
   message?: string;
   resolutions: number[];
   resolution: number | null;
+  referer?: string;
 };
 
 type FoundEntry = ProbeEntry & {
@@ -203,6 +204,20 @@ function compactUrl(url: string) {
   }
 }
 
+function isYoutubeUrl(raw: string) {
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return (
+      host === "youtu.be" ||
+      host.endsWith(".youtu.be") ||
+      host === "youtube.com" ||
+      host.endsWith(".youtube.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function App() {
   const sourceInputRef = useRef<HTMLTextAreaElement>(null);
   const availableUpdate = useRef<Update | null>(null);
@@ -232,7 +247,7 @@ export function App() {
   );
   const [isConfirming, setIsConfirming] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [appVersion, setAppVersion] = useState("1.1.0");
+  const [appVersion, setAppVersion] = useState("1.1.1");
   const [updateState, setUpdateState] = useState<UpdateState>({
     status: "idle",
     progress: 0,
@@ -521,12 +536,14 @@ export function App() {
       if (String(extractorError).includes("Busqueda detenida")) {
         throw extractorError;
       }
+      if (isYoutubeUrl(url)) {
+        throw new Error(`YouTube: ${String(extractorError)}`);
+      }
       try {
         const result = await invoke<ProbeResult>("scan_page", {
           url,
           referer: referer.trim() || null
         });
-        if (!referer.trim()) setReferer(url);
         return result;
       } catch (scanError) {
         if (String(scanError).includes("Busqueda detenida")) {
@@ -702,12 +719,17 @@ export function App() {
     addToQueue(
       urls.map((url) => ({
         url,
-        title: compactUrl(url)
+        title: compactUrl(url),
+        referer: url
       }))
     );
   }
 
   function addSelectedFound() {
+    if (!selectedFound.length) {
+      setNotice("Selecciona al menos una fuente para agregar.");
+      return;
+    }
     addToQueue(foundEntriesToQueueInput(selectedFound));
   }
 
@@ -720,14 +742,28 @@ export function App() {
   }
 
   function addFoundGroup(groupId: string) {
-    addToQueue(foundEntriesToQueueInput(entriesForGroup(groupId)));
+    const entries = entriesForGroup(groupId);
+    if (!entries.length) {
+      setNotice("Selecciona una fuente para este contenido.");
+      return;
+    }
+    addToQueue(foundEntriesToQueueInput(entries));
   }
 
   async function downloadFoundGroup(groupId: string) {
-    await downloadFoundEntries(entriesForGroup(groupId));
+    const entries = entriesForGroup(groupId);
+    if (!entries.length) {
+      setNotice("Selecciona una fuente para descargar este contenido.");
+      return;
+    }
+    await downloadFoundEntries(entries);
   }
 
   async function downloadFoundEntries(entries: FoundEntry[]) {
+    if (!entries.length) {
+      setNotice("Selecciona al menos una fuente para descargar.");
+      return;
+    }
     const inputs = foundEntriesToQueueInput(entries);
     const fresh = addToQueue(inputs);
     const selectedUrls = new Set(inputs.map((item) => item.url));
@@ -749,7 +785,8 @@ export function App() {
       url: entry.webpage_url || entry.url,
       title: entry.contentTitle || entryTitle(entry),
       resolutions: entry.resolutions,
-      resolution: entry.resolution
+      resolution: entry.resolution,
+      referer: entry.sourcePage
     }));
   }
 
@@ -759,6 +796,7 @@ export function App() {
       title: string;
       resolutions?: number[];
       resolution?: number | null;
+      referer?: string;
     }>
   ) {
     const normalized = items.filter((item) => item.url.trim());
@@ -774,7 +812,8 @@ export function App() {
         status: "pending",
         progress: 0,
         resolutions: item.resolutions ?? [],
-        resolution: item.resolution ?? null
+        resolution: item.resolution ?? null,
+        referer: item.referer
       }));
 
     if (!fresh.length) {
@@ -810,7 +849,8 @@ export function App() {
       id: item.id,
       title: item.title,
       url: item.url,
-      maxHeight: item.resolution
+      maxHeight: item.resolution,
+      referer: item.referer
     }));
     const jobIds = new Set(jobs.map((job) => job.id));
 
@@ -1020,7 +1060,7 @@ export function App() {
           </div>
 
           <label className="field">
-            <span>Referer</span>
+            <span>Referer manual (opcional)</span>
             <input
               value={referer}
               onChange={(event) => setReferer(event.target.value)}
@@ -1094,7 +1134,6 @@ export function App() {
                 <button
                   className="ghost-button compact-button"
                   onClick={addSelectedFound}
-                  disabled={!selectedFound.length}
                   title="Agregar seleccionados"
                 >
                   <Plus size={17} />
@@ -1103,7 +1142,7 @@ export function App() {
                 <button
                   className="primary-button compact-button"
                   onClick={downloadSelectedFound}
-                  disabled={!selectedFound.length || isRunning}
+                  disabled={isRunning}
                   title="Descargar seleccionados"
                 >
                   <Download size={17} />
@@ -1131,7 +1170,6 @@ export function App() {
                         <button
                           className="ghost-button compact-button"
                           onClick={() => addFoundGroup(group.id)}
-                          disabled={!selectedInGroup}
                           title="Agregar este contenido a la cola"
                         >
                           <Plus size={16} />
@@ -1140,7 +1178,7 @@ export function App() {
                         <button
                           className="primary-button compact-button"
                           onClick={() => void downloadFoundGroup(group.id)}
-                          disabled={!selectedInGroup || isRunning}
+                          disabled={isRunning}
                           title="Descargar este contenido"
                         >
                           <Download size={16} />
@@ -1161,8 +1199,7 @@ export function App() {
                       {group.entries.map((entry) => (
                         <div className="found-row" key={entry.url}>
                           <input
-                            type={group.entries.length > 1 ? "radio" : "checkbox"}
-                            name={group.entries.length > 1 ? `source-${group.id}` : undefined}
+                            type="checkbox"
                             aria-label={`Seleccionar ${entryTitle(entry)}`}
                             checked={entry.selected}
                             onChange={(event) => {

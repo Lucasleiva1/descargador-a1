@@ -1,6 +1,6 @@
 [package]
 name = "descargador-a1"
-version = "1.1.0"
+version = "1.1.1"
 description = "Video download queue powered by yt-dlp"
 authors = ["Jaell"]
 license = ""

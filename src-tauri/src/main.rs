@@ -101,6 +101,7 @@ struct DownloadJob {
     url: String,
     #[serde(rename = "maxHeight")]
     max_height: Option<u32>,
+    referer: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -811,14 +812,6 @@ async fn start_download(
     }
 
     let active = state.active.clone();
-    let yt_dlp = match locate_yt_dlp(&app) {
-        Ok(path) => path,
-        Err(error) => {
-            active.store(false, Ordering::SeqCst);
-            return Err(error);
-        }
-    };
-
     let output_dir = normalize_output_dir(output_dir)?;
     if let Some(path) = &output_dir {
         fs::create_dir_all(path)
@@ -865,7 +858,6 @@ async fn start_download(
                 break;
             };
             let task_app = app.clone();
-            let task_yt_dlp = yt_dlp.clone();
             let task_output_dir = output_dir.clone();
             let task_referer = referer.clone();
             let task_browser = browser.clone();
@@ -885,10 +877,12 @@ async fn start_download(
                     } else {
                         run_download_job(
                             &task_app,
-                            &task_yt_dlp,
                             &job,
                             task_output_dir.as_ref(),
-                            task_referer.as_deref(),
+                            task_referer
+                                .as_deref()
+                                .filter(|value| !value.trim().is_empty())
+                                .or(job.referer.as_deref()),
                             task_browser.as_deref(),
                             cancellation,
                             task_updates.clone(),
@@ -946,7 +940,6 @@ async fn cancel_download(state: State<'_, DownloadState>, id: String) -> Result<
 #[allow(clippy::too_many_arguments)]
 async fn run_download_job(
     app: &AppHandle,
-    yt_dlp: &PathBuf,
     job: &DownloadJob,
     output_dir: Option<&PathBuf>,
     referer: Option<&str>,
@@ -973,6 +966,27 @@ async fn run_download_job(
         run_mediafire_download_job(app, job, output_dir, cancellation, updates).await;
         return;
     }
+
+    let yt_dlp = match locate_yt_dlp(app) {
+        Ok(path) => path,
+        Err(error) => {
+            publish_update(
+                app,
+                &updates,
+                DownloadUpdate {
+                    id: job.id.clone(),
+                    status: "failed".to_string(),
+                    progress: None,
+                    speed: None,
+                    eta: None,
+                    file: None,
+                    message: Some(error),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
     let mut args = vec![
         "--newline".to_string(),
@@ -1056,7 +1070,7 @@ async fn run_download_job(
 
     args.push(job.url.clone());
 
-    let mut child = match Command::new(yt_dlp)
+    let mut child = match Command::new(&yt_dlp)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2381,6 +2395,7 @@ fn locate_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
 
     if let Ok(resource_dir) = app.path().resource_dir() {
         candidates.push(resource_dir.join("tools").join(executable));
+        candidates.push(resource_dir.join("_up_").join("tools").join(executable));
         candidates.push(resource_dir.join(executable));
     }
 

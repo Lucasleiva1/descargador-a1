@@ -17,6 +17,6 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "rustls-tls"] }
 scraper = "0.24"
 tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["io-util", "process", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "sync"] }
 url = "2"
 which = "8"

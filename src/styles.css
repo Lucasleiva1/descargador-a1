@@ -332,6 +332,25 @@ input:focus {
   color: var(--red);
 }
 
+.danger-button {
+  color: #fff;
+  background: #c9413a;
+}
+
+.danger-button:hover:not(:disabled) {
+  background: #e2534b;
+}
+
+.stop-button {
+  color: #ffd28b;
+  border-color: rgba(240, 166, 58, 0.44);
+}
+
+.compact-icon-button {
+  width: 34px;
+  min-height: 34px;
+}
+
 .primary-button:active:not(:disabled),
 .ghost-button:active:not(:disabled),
 .icon-button:active:not(:disabled) {
@@ -474,6 +493,10 @@ button:disabled {
   border-color: rgba(94, 224, 143, 0.4);
 }
 
+.queue-row.cancelled {
+  border-color: rgba(240, 166, 58, 0.4);
+}
+
 .queue-row.failed {
   border-color: rgba(255, 107, 97, 0.42);
 }
@@ -556,6 +579,12 @@ button:disabled {
   background: rgba(94, 224, 143, 0.12);
 }
 
+.status-pill.cancelled {
+  color: #ffd28b;
+  border-color: rgba(240, 166, 58, 0.35);
+  background: rgba(240, 166, 58, 0.12);
+}
+
 .status-pill.failed {
   color: var(--red);
   border-color: rgba(255, 107, 97, 0.35);
@@ -592,6 +621,76 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.confirm-dialog {
+  position: relative;
+  width: min(430px, 100%);
+  padding: 24px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.62);
+}
+
+.dialog-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.dialog-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 16px;
+  color: var(--red);
+  border: 1px solid rgba(255, 107, 97, 0.36);
+  border-radius: 8px;
+  background: rgba(255, 107, 97, 0.12);
+}
+
+.confirm-dialog h2 {
+  padding-right: 44px;
+  font-size: 19px;
+}
+
+.confirm-dialog p {
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.confirm-dialog strong {
+  display: block;
+  margin-top: 14px;
+  padding: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--field);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 20px;
 }
 
 .log-panel {

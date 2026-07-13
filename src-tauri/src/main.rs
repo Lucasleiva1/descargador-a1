@@ -3,7 +3,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     process::Stdio,
@@ -16,7 +16,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::Command,
+    process::{Child, Command},
+    sync::{Mutex, Notify},
 };
 use url::Url;
 
@@ -28,6 +29,24 @@ const FOLLOW_DELAY_MS: u64 = 450;
 #[derive(Default)]
 struct DownloadState {
     active: Arc<AtomicBool>,
+    jobs: Arc<Mutex<HashMap<String, Arc<JobCancellation>>>>,
+}
+
+#[derive(Default)]
+struct JobCancellation {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl JobCancellation {
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +303,14 @@ async fn start_download(
             .map_err(|error| format!("No pude crear la carpeta de salida: {error}"))?;
     }
 
+    let job_controls = state.jobs.clone();
+    {
+        let mut controls = job_controls.lock().await;
+        for job in &jobs {
+            controls.insert(job.id.clone(), Arc::new(JobCancellation::default()));
+        }
+    }
+
     tauri::async_runtime::spawn(async move {
         let _ = app.emit(
             "download://batch-state",
@@ -294,7 +321,28 @@ async fn start_download(
         );
 
         for job in jobs {
-            run_download_job(&app, &yt_dlp, &job, output_dir.as_ref(), referer.as_deref()).await;
+            let cancellation = {
+                let controls = job_controls.lock().await;
+                controls.get(&job.id).cloned()
+            };
+
+            if let Some(cancellation) = cancellation {
+                if cancellation.is_cancelled() {
+                    emit_cancelled(&app, &job.id);
+                } else {
+                    run_download_job(
+                        &app,
+                        &yt_dlp,
+                        &job,
+                        output_dir.as_ref(),
+                        referer.as_deref(),
+                        cancellation,
+                    )
+                    .await;
+                }
+            }
+
+            job_controls.lock().await.remove(&job.id);
         }
 
         active.store(false, Ordering::SeqCst);
@@ -310,12 +358,28 @@ async fn start_download(
     Ok(())
 }
 
+#[tauri::command]
+async fn cancel_download(state: State<'_, DownloadState>, id: String) -> Result<bool, String> {
+    let cancellation = {
+        let controls = state.jobs.lock().await;
+        controls.get(&id).cloned()
+    };
+
+    if let Some(cancellation) = cancellation {
+        cancellation.cancel();
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 async fn run_download_job(
     app: &AppHandle,
     yt_dlp: &PathBuf,
     job: &DownloadJob,
     output_dir: Option<&PathBuf>,
     referer: Option<&str>,
+    cancellation: Arc<JobCancellation>,
 ) {
     emit_update(
         app,
@@ -400,7 +464,18 @@ async fn run_download_job(
         })
     });
 
-    let result = child.wait().await;
+    let result = if cancellation.is_cancelled() {
+        terminate_child(&mut child).await;
+        None
+    } else {
+        tokio::select! {
+            result = child.wait() => Some(result),
+            _ = cancellation.notify.notified() => {
+                terminate_child(&mut child).await;
+                None
+            }
+        }
+    };
 
     if let Some(task) = stdout_task {
         let _ = task.await;
@@ -410,7 +485,8 @@ async fn run_download_job(
     }
 
     match result {
-        Ok(status) if status.success() => emit_update(
+        None => emit_cancelled(app, &job.id),
+        Some(Ok(status)) if status.success() => emit_update(
             app,
             DownloadUpdate {
                 id: job.id.clone(),
@@ -422,7 +498,7 @@ async fn run_download_job(
                 message: Some("Descarga completa.".to_string()),
             },
         ),
-        Ok(status) => emit_update(
+        Some(Ok(status)) => emit_update(
             app,
             DownloadUpdate {
                 id: job.id.clone(),
@@ -434,7 +510,7 @@ async fn run_download_job(
                 message: Some(format!("yt-dlp terminó con código {status}")),
             },
         ),
-        Err(error) => emit_update(
+        Some(Err(error)) => emit_update(
             app,
             DownloadUpdate {
                 id: job.id.clone(),
@@ -447,6 +523,36 @@ async fn run_download_job(
             },
         ),
     }
+}
+
+async fn terminate_child(child: &mut Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+fn emit_cancelled(app: &AppHandle, id: &str) {
+    emit_update(
+        app,
+        DownloadUpdate {
+            id: id.to_string(),
+            status: "cancelled".to_string(),
+            progress: None,
+            speed: None,
+            eta: None,
+            file: None,
+            message: Some("Descarga detenida.".to_string()),
+        },
+    );
 }
 
 async fn read_process_stream<R>(app: AppHandle, job_id: String, stream: R)
@@ -1281,7 +1387,8 @@ fn main() {
             check_tools,
             probe_url,
             scan_page,
-            start_download
+            start_download,
+            cancel_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -12,7 +12,9 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Square,
   Trash2,
+  X,
   XCircle
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -24,6 +26,7 @@ type DownloadStatus =
   | "downloading"
   | "processing"
   | "completed"
+  | "cancelled"
   | "failed";
 
 type ToolProbe = {
@@ -86,12 +89,18 @@ type BatchStateEvent = {
   message?: string;
 };
 
+type QueueConfirmation = {
+  action: "stop" | "delete";
+  item: QueueItem;
+};
+
 const statusCopy: Record<DownloadStatus, string> = {
   pending: "Pendiente",
   extracting: "Extrayendo",
   downloading: "Descargando",
   processing: "Procesando",
   completed: "Completo",
+  cancelled: "Detenida",
   failed: "Fallo"
 };
 
@@ -101,8 +110,13 @@ const statusIcon: Record<DownloadStatus, ReactNode> = {
   downloading: <Download size={16} />,
   processing: <RefreshCw size={16} className="spin" />,
   completed: <CheckCircle2 size={16} />,
+  cancelled: <Square size={15} />,
   failed: <AlertCircle size={16} />
 };
+
+function isActiveStatus(status: DownloadStatus) {
+  return ["extracting", "downloading", "processing"].includes(status);
+}
 
 function makeId() {
   return crypto.randomUUID();
@@ -137,6 +151,10 @@ export function App() {
   const [isProbing, setIsProbing] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [notice, setNotice] = useState("");
+  const [confirmation, setConfirmation] = useState<QueueConfirmation | null>(
+    null
+  );
+  const [isConfirming, setIsConfirming] = useState(false);
 
   const selectedFound = useMemo(
     () => found.filter((entry) => entry.selected),
@@ -147,10 +165,9 @@ export function App() {
     const total = queue.length;
     const done = queue.filter((item) => item.status === "completed").length;
     const failed = queue.filter((item) => item.status === "failed").length;
-    const active = queue.filter((item) =>
-      ["extracting", "downloading", "processing"].includes(item.status)
-    ).length;
-    return { total, done, failed, active };
+    const active = queue.filter((item) => isActiveStatus(item.status)).length;
+    const stopped = queue.filter((item) => item.status === "cancelled").length;
+    return { total, done, failed, active, stopped };
   }, [queue]);
 
   useEffect(() => {
@@ -202,6 +219,17 @@ export function App() {
       unlistenBatch?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (!confirmation) return;
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape" && !isConfirming) setConfirmation(null);
+    }
+
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [confirmation, isConfirming]);
 
   async function refreshTools() {
     try {
@@ -321,7 +349,10 @@ export function App() {
 
   async function startQueue() {
     const items = queue.filter(
-      (item) => item.status === "pending" || item.status === "failed"
+      (item) =>
+        item.status === "pending" ||
+        item.status === "failed" ||
+        item.status === "cancelled"
     );
 
     if (!items.length) {
@@ -391,6 +422,53 @@ export function App() {
     setQueue([]);
     setLogs([]);
     setFound([]);
+  }
+
+  async function confirmQueueAction() {
+    if (!confirmation) return;
+
+    const { action, item } = confirmation;
+    const currentItem = queue.find((entry) => entry.id === item.id) ?? item;
+    setIsConfirming(true);
+
+    try {
+      const shouldCancel = action === "stop" || isActiveStatus(currentItem.status);
+      const cancelled = shouldCancel
+        ? await invoke<boolean>("cancel_download", { id: item.id })
+        : false;
+
+      if (action === "delete") {
+        setQueue((current) => current.filter((entry) => entry.id !== item.id));
+        setNotice(
+          cancelled
+            ? "Descarga detenida y eliminada de la lista."
+            : "Descarga eliminada de la lista."
+        );
+      } else if (cancelled) {
+        setQueue((current) =>
+          current.map((entry) =>
+            entry.id === item.id
+              ? {
+                  ...entry,
+                  status: "cancelled",
+                  speed: undefined,
+                  eta: undefined,
+                  message: "Descarga detenida."
+                }
+              : entry
+          )
+        );
+        setNotice("Descarga detenida.");
+      } else {
+        setNotice("La descarga ya habia terminado.");
+      }
+
+      setConfirmation(null);
+    } catch (error) {
+      setNotice(`No pude completar la accion: ${String(error)}`);
+    } finally {
+      setIsConfirming(false);
+    }
   }
 
   const ytReady = tools?.yt_dlp.available ?? false;
@@ -550,7 +628,7 @@ export function App() {
               <h2>Descargas</h2>
               <p>
                 {queueStats.done} completas - {queueStats.active} activas -{" "}
-                {queueStats.failed} con error
+                {queueStats.stopped} detenidas - {queueStats.failed} con error
               </p>
             </div>
 
@@ -606,6 +684,8 @@ export function App() {
                   item={item}
                   canDownload={ytReady && !isRunning}
                   onDownload={() => startJobs([item])}
+                  onStop={() => setConfirmation({ action: "stop", item })}
+                  onDelete={() => setConfirmation({ action: "delete", item })}
                   key={item.id}
                 />
               ))
@@ -628,6 +708,82 @@ export function App() {
           </div>
         </section>
       </section>
+
+      {confirmation && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target && !isConfirming) {
+              setConfirmation(null);
+            }
+          }}
+        >
+          <section
+            className="confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            aria-describedby="confirm-description"
+          >
+            <button
+              className="icon-button dialog-close"
+              onClick={() => setConfirmation(null)}
+              disabled={isConfirming}
+              title="Cerrar"
+              autoFocus
+            >
+              <X size={18} />
+            </button>
+
+            <div className="dialog-icon">
+              {confirmation.action === "stop" ? (
+                <Square size={22} />
+              ) : (
+                <Trash2 size={22} />
+              )}
+            </div>
+            <h2 id="confirm-title">
+              {confirmation.action === "stop"
+                ? "Detener descarga"
+                : "Eliminar descarga"}
+            </h2>
+            <p id="confirm-description">
+              {confirmation.action === "stop"
+                ? "La descarga se detendra y podras iniciarla nuevamente desde la lista."
+                : isActiveStatus(confirmation.item.status)
+                  ? "La descarga se detendra y se eliminara de la lista."
+                  : "La descarga se eliminara de la lista."}
+            </p>
+            <strong title={confirmation.item.title}>
+              {confirmation.item.title}
+            </strong>
+
+            <div className="dialog-actions">
+              <button
+                className="ghost-button"
+                onClick={() => setConfirmation(null)}
+                disabled={isConfirming}
+              >
+                Cancelar
+              </button>
+              <button
+                className="primary-button danger-button"
+                onClick={confirmQueueAction}
+                disabled={isConfirming}
+              >
+                {isConfirming ? (
+                  <Loader2 size={17} className="spin" />
+                ) : confirmation.action === "stop" ? (
+                  <Square size={16} />
+                ) : (
+                  <Trash2 size={17} />
+                )}
+                {confirmation.action === "stop" ? "Detener" : "Eliminar"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -659,13 +815,21 @@ function ToolBadge({
 function QueueRow({
   item,
   canDownload,
-  onDownload
+  onDownload,
+  onStop,
+  onDelete
 }: {
   item: QueueItem;
   canDownload: boolean;
   onDownload: () => void;
+  onStop: () => void;
+  onDelete: () => void;
 }) {
-  const isPending = item.status === "pending" || item.status === "failed";
+  const isPending =
+    item.status === "pending" ||
+    item.status === "failed" ||
+    item.status === "cancelled";
+  const isActive = isActiveStatus(item.status);
 
   return (
     <article className={`queue-row ${item.status}`}>
@@ -690,6 +854,23 @@ function QueueRow({
               Descargar
             </button>
           )}
+          {isActive && (
+            <button
+              className="ghost-button compact-button stop-button"
+              onClick={onStop}
+              title="Detener esta descarga"
+            >
+              <Square size={15} />
+              Detener
+            </button>
+          )}
+          <button
+            className="icon-button danger compact-icon-button"
+            onClick={onDelete}
+            title="Eliminar esta descarga"
+          >
+            <Trash2 size={16} />
+          </button>
           <span className={`status-pill ${item.status}`}>
             {statusCopy[item.status]}
           </span>
